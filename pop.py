@@ -18,9 +18,10 @@ from aiogram.types import (
 # ----------------------------------------------------
 # 1. КОНФИГУРАЦИЯ И ВЛАДЕЛЕЦ
 # ----------------------------------------------------
-# Получаем токен из переменной окружения BOT_TOK
 BOT_TOKEN = os.getenv("BOT_TOK", "ТВОЙ_ТОКЕН_ПО_УМОЛЧАНИЮ_ЕСЛИ_НЕТ_ENV")
 OWNER_ID = 5480751648  # ID владельца с бесконечным балансом
+ADMIN_IDS = [5480751648]  # Список Telegram ID админов, имеющих доступ к /allb и /annb
+
 DB_NAME = "bot.db"
 
 # Время перезарядки бонуса: 1.5 часа = 5400 секунд
@@ -42,22 +43,19 @@ RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36
 BLACK_NUMBERS = {2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35}
 
 # ----------------------------------------------------
-# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И ЯЗЫК
+# 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ----------------------------------------------------
 def get_balance_str(tg_id: int, balance: float) -> str:
-    """Возвращает знак бесконечности для владельца или отформатированную сумму."""
     if tg_id == OWNER_ID:
         return "∞"
     return f"{balance:,.2f}"
 
 def check_balance(tg_id: int, current_balance: float, required_amount: float) -> bool:
-    """Проверяет, хватает ли средств (для владельца всегда True)."""
     if tg_id == OWNER_ID:
         return True
     return current_balance >= required_amount
 
 def format_time_remaining(seconds: int) -> str:
-    """Форматирует секундное время в формат Ч:ММ или М:СС"""
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     if hours > 0:
@@ -67,10 +65,6 @@ def format_time_remaining(seconds: int) -> str:
         return f"{minutes}:{secs:02d}"
 
 def parse_amount(text: str, current_balance: float = 0.0) -> float | None:
-    """
-    Парсит сумму с поддержкой сокращений (1k, 1m, 1b, 1кк, все/всё) 
-    и удаляет разделители тысяч.
-    """
     if not text:
         return None
         
@@ -99,10 +93,6 @@ def parse_amount(text: str, current_balance: float = 0.0) -> float | None:
         return None
 
 async def get_user_lang(chat_type: str, tg_id: int) -> str:
-    """
-    Возвращает 'ru' если это группа/супергруппа.
-    В личных сообщениях возвращает выбранный язык пользователя ('ru' или 'en').
-    """
     if chat_type in ["group", "supergroup"]:
         return "ru"
         
@@ -180,7 +170,6 @@ async def get_or_create_user(tg_id: int, username: str | None = None):
         return user
 
 async def get_user_by_identifier(identifier: str):
-    """Находит пользователя по ID или @username."""
     identifier = identifier.strip()
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
@@ -256,7 +245,7 @@ def balance_inline_keyboard():
         [InlineKeyboardButton(text="🎁 Бонус", callback_data="claim_bonus")]
     ])
 
-def build_mines_keyboard(opened: set, mines: set, game_over: bool = False, is_win: bool = False):
+def build_mines_keyboard(user_id: int, opened: set, mines: set, game_over: bool = False, is_win: bool = False):
     keyboard = []
     for row in range(5):
         line = []
@@ -266,34 +255,82 @@ def build_mines_keyboard(opened: set, mines: set, game_over: bool = False, is_wi
                 text = "💣" if idx in mines else "💎"
             else:
                 text = "💣" if (game_over and idx in mines) else "❓"
-            cb_data = "mine_disabled" if game_over else f"mine_click:{idx}"
+            
+            cb_data = f"mine_dis:{user_id}" if game_over else f"mine_c:{idx}:{user_id}"
             line.append(InlineKeyboardButton(text=text, callback_data=cb_data))
         keyboard.append(line)
     
     bottom_symbol = ("✅" if is_win else "❌") if game_over else ("✅" if len(opened) > 0 else "❌")
-    cb_data = "mine_disabled" if game_over else "mine_take"
+    cb_data = f"mine_dis:{user_id}" if game_over else f"mine_t:{user_id}"
     keyboard.append([InlineKeyboardButton(text=bottom_symbol, callback_data=cb_data)])
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def build_joker_keyboard(cards: list | None = None, game_over: bool = False, is_win: bool = False):
+def build_joker_keyboard(user_id: int, cards: list | None = None, game_over: bool = False, is_win: bool = False):
     line = []
     if not game_over:
         for idx in range(3):
-            line.append(InlineKeyboardButton(text="🎴", callback_data=f"joker_click:{idx}"))
-        keyboard = [line, [InlineKeyboardButton(text="❌", callback_data="joker_cancel")]]
+            line.append(InlineKeyboardButton(text="🎴", callback_data=f"joker_c:{idx}:{user_id}"))
+        keyboard = [line, [InlineKeyboardButton(text="❌", callback_data=f"joker_can:{user_id}")]]
     else:
         for card in cards:
-            line.append(InlineKeyboardButton(text=card, callback_data="joker_disabled"))
+            line.append(InlineKeyboardButton(text=card, callback_data=f"joker_dis:{user_id}"))
         bottom_symbol = "✅" if is_win else "❌"
-        keyboard = [line, [InlineKeyboardButton(text=bottom_symbol, callback_data="joker_disabled")]]
+        keyboard = [line, [InlineKeyboardButton(text=bottom_symbol, callback_data=f"joker_dis:{user_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # ----------------------------------------------------
-# 5. ХЭНДЛЕРЫ КОМАНД И КНОПОК
+# 5. АДМИН-КОМАНДЫ
 # ----------------------------------------------------
+@dp.message(Command("allb"))
+async def cmd_allb(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
 
-# --- START (Игнорируется в группах) ---
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("❌ Использование: `/allb [сумма]`", parse_mode="Markdown")
+        return
+
+    parsed = parse_amount(parts[1])
+    if parsed is None or parsed <= 0:
+        await message.reply("❌ Укажите корректную сумму!")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id != ?", (parsed, OWNER_ID))
+        await db.commit()
+
+    await message.reply(f"✅ Всем пользователям начислено по `{parsed:,.2f}` монет!", parse_mode="Markdown")
+
+@dp.message(Command("annb"))
+async def cmd_annb(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) > 1:
+        target_str = parts[1]
+        target_user = await get_user_by_identifier(target_str)
+        if not target_user:
+            await message.reply("❌ Пользователь не найден!")
+            return
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET balance = 0 WHERE tg_id = ?", (target_user['tg_id'],))
+            await db.commit()
+            
+        await message.reply(f"🔥 Баланс пользователя @{target_user['username']} (ID: {target_user['tg_id']}) аннулирован!")
+    else:
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute("UPDATE users SET balance = 0 WHERE tg_id != ?", (OWNER_ID,))
+            await db.commit()
+            
+        await message.reply("🔥 Баланс **всех игроков** был успешно аннулирован!", parse_mode="Markdown")
+
+# ----------------------------------------------------
+# 6. ОСНОВНЫЕ КОМАНДЫ
+# ----------------------------------------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     if message.chat.type in ["group", "supergroup"]:
@@ -329,7 +366,6 @@ async def cmd_start(message: types.Message):
     if message.chat.type == "private":
         await message.answer(menu_text, reply_markup=main_reply_keyboard(lang))
 
-# --- О НАС ---
 @dp.message(F.text.in_(["🗣 О нас", "о нас", "О нас", "about us", "About Us", "/about", "🗣 About Us"]))
 async def menu_about(message: types.Message):
     about_text = (
@@ -338,7 +374,6 @@ async def menu_about(message: types.Message):
     )
     await message.reply(about_text)
 
-# --- ИЗМЕНИТЬ ЯЗЫК ---
 @dp.message(F.text.in_(["😶‍🌫 Изменить язык", "изменить язык", "язык", "Language", "Change Language", "😶‍🌫 Change Language", "/language", "/lang"]))
 async def menu_change_language(message: types.Message):
     lang = await get_user_lang(message.chat.type, message.from_user.id)
@@ -613,10 +648,10 @@ async def make_duel(message: types.Message):
     )
 
 # ----------------------------------------------------
-# 6. МИНИ-ИГРЫ (МИНЫ И ДЖОКЕР)
+# 7. МИНИ-ИГРЫ (СЛОЖНЫЙ УРОВЕНЬ + АНТИ-ПЕРЕХВАТ)
 # ----------------------------------------------------
 
-# --- МИНЫ ---
+# --- МИНЫ (7 МИН) ---
 @dp.message(F.text.lower().startswith("мины"))
 async def game_mines(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -637,7 +672,9 @@ async def game_mines(message: types.Message):
         return
 
     await update_balance(user['tg_id'], -bet)
-    mines = set(random.sample(range(25), 5))
+    
+    # ТЕПЕРЬ 7 МИН ИЗ 25 ПОЛЕЙ
+    mines = set(random.sample(range(25), 7))
 
     active_mines_games[game_key] = {
         "bet": bet,
@@ -651,24 +688,30 @@ async def game_mines(message: types.Message):
 
     display_name = f"@{user['username']}" if user['username'] and user['username'] != "Неизвестно" else "Игрок"
     text = (
-        f"{display_name}, вы начали игру минное поле!\n"
+        f"{display_name}, вы начали игру минное поле (7 мин)!\n"
         f"💰 Ставка: {bet:,.0f} GRAM"
     )
     
-    reply_markup = build_mines_keyboard(set(), mines, game_over=False)
+    reply_markup = build_mines_keyboard(user['tg_id'], set(), mines, game_over=False)
     await message.reply(text, reply_markup=reply_markup)
 
 
-@dp.callback_query(F.data.startswith("mine_click:"))
+@dp.callback_query(F.data.startswith("mine_c:"))
 async def callback_mine_click(callback: types.CallbackQuery):
-    game_key = (callback.message.chat.id, callback.from_user.id)
+    parts = callback.data.split(":")
+    cell_idx = int(parts[1])
+    owner_id = int(parts[2])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = (callback.message.chat.id, owner_id)
     game = active_mines_games.get(game_key)
 
     if not game:
-        await callback.answer("Эта игра завершена или принадлежит не вам!", show_alert=True)
+        await callback.answer("Эта игра завершена!", show_alert=True)
         return
-
-    cell_idx = int(callback.data.split(":")[1])
 
     if cell_idx in game["opened"]:
         await callback.answer("Эта клетка уже открыта!")
@@ -680,7 +723,7 @@ async def callback_mine_click(callback: types.CallbackQuery):
     if cell_idx in game["mines"]:
         await add_history(game["user_id"], "Минное поле (Поражение)", -game["bet"])
         
-        reply_markup = build_mines_keyboard(game["opened"], game["mines"], game_over=True, is_win=False)
+        reply_markup = build_mines_keyboard(owner_id, game["opened"], game["mines"], game_over=True, is_win=False)
         text = (
             f"💥 {display_name}, вы подорвались на мине!\n"
             f"💰 Потеряно: {game['bet']:,.0f} GRAM"
@@ -691,12 +734,13 @@ async def callback_mine_click(callback: types.CallbackQuery):
         return
 
     game["step"] += 1
+    # УРЕЗАННЫЕ МНОЖИТЕЛИ: 1-й шаг x1.3, дальше x1.15 за каждый
     if game["step"] == 1:
-        game["current_win"] = game["bet"] * 5.30
+        game["current_win"] = round(game["bet"] * 1.30, 2)
     else:
-        game["current_win"] = round(game["current_win"] * 1.25, 2)
+        game["current_win"] = round(game["current_win"] * 1.15, 2)
 
-    reply_markup = build_mines_keyboard(game["opened"], game["mines"], game_over=False)
+    reply_markup = build_mines_keyboard(owner_id, game["opened"], game["mines"], game_over=False)
     text = (
         f"💎 {display_name}, отличный ход!\n"
         f"💰 Ставка: {game['bet']:,.0f} GRAM\n"
@@ -706,13 +750,19 @@ async def callback_mine_click(callback: types.CallbackQuery):
     await callback.answer(f"💎 Успешно! Выигрыш: {game['current_win']:,.2f} GRAM")
 
 
-@dp.callback_query(F.data == "mine_take")
+@dp.callback_query(F.data.startswith("mine_t:"))
 async def callback_mine_take(callback: types.CallbackQuery):
-    game_key = (callback.message.chat.id, callback.from_user.id)
+    owner_id = int(callback.data.split(":")[1])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = (callback.message.chat.id, owner_id)
     game = active_mines_games.get(game_key)
 
     if not game:
-        await callback.answer("Эта игра завершена или принадлежит не вам!", show_alert=True)
+        await callback.answer("Эта игра завершена!", show_alert=True)
         return
 
     if game["step"] == 0:
@@ -729,19 +779,19 @@ async def callback_mine_take(callback: types.CallbackQuery):
         f"💰 Заработано: **{win_amount:,.2f}** GRAM"
     )
     
-    reply_markup = build_mines_keyboard(game["opened"], game["mines"], game_over=True, is_win=True)
+    reply_markup = build_mines_keyboard(owner_id, game["opened"], game["mines"], game_over=True, is_win=True)
     del active_mines_games[game_key]
     
     await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     await callback.answer(f"✅ Вы забрали {win_amount:,.2f} GRAM!")
 
 
-@dp.callback_query(F.data == "mine_disabled")
+@dp.callback_query(F.data.startswith("mine_dis:"))
 async def callback_mine_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 
-# --- ДЖОКЕР ---
+# --- ДЖОКЕР (УСЛОЖНЕННЫЙ + АНТИ-ПЕРЕХВАТ) ---
 @dp.message(F.text.lower().startswith("джокер"))
 async def game_joker(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -779,36 +829,44 @@ async def game_joker(message: types.Message):
         f"💰 Ставка: {bet:,.0f} GRAM"
     )
 
-    reply_markup = build_joker_keyboard()
+    reply_markup = build_joker_keyboard(user['tg_id'])
     await message.reply(text, reply_markup=reply_markup)
 
 
-@dp.callback_query(F.data.startswith("joker_click:"))
+@dp.callback_query(F.data.startswith("joker_c:"))
 async def callback_joker_click(callback: types.CallbackQuery):
-    game_key = (callback.message.chat.id, callback.from_user.id)
+    parts = callback.data.split(":")
+    idx = int(parts[1])
+    owner_id = int(parts[2])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = (callback.message.chat.id, owner_id)
     game = active_joker_games.get(game_key)
 
     if not game:
-        await callback.answer("Эта игра завершена или принадлежит не вам!", show_alert=True)
+        await callback.answer("Эта игра завершена!", show_alert=True)
         return
 
-    idx = int(callback.data.split(":")[1])
     chosen_card = game["cards"][idx]
     bet = game["bet"]
     user_id = game["user_id"]
     display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
 
     is_win = False
+    # УРЕЗАННЫЕ ВЫИГРЫШИ ДЖОКЕРА
     if chosen_card == "🃏":
         is_win = True
-        win_amount = bet * 3.0
+        win_amount = bet * 1.8  # Вместо x3.0
         await update_balance(user_id, win_amount)
         await add_history(user_id, "Джокер (ДЖОКЕР!)", win_amount - bet)
         result_text = f"🃏 **ДЖОКЕР!** {display_name}, вы сорвали куш и выиграли **{win_amount:,.0f}** GRAM!"
         alert_text = f"🃏 ДЖОКЕР! Выигрыш: {win_amount:,.0f} GRAM"
     elif chosen_card == "💎":
         is_win = True
-        win_amount = bet * 1.5
+        win_amount = bet * 1.2  # Вместо x1.5
         await update_balance(user_id, win_amount)
         await add_history(user_id, "Джокер (Удача)", win_amount - bet)
         result_text = f"💎 {display_name}, вам выпала карта удачи! Выигрыш: **{win_amount:,.0f}** GRAM!"
@@ -818,7 +876,7 @@ async def callback_joker_click(callback: types.CallbackQuery):
         result_text = f"💥 {display_name}, вы не угадали! Ставка **{bet:,.0f}** GRAM сгорела."
         alert_text = "💥 Неудача!"
 
-    reply_markup = build_joker_keyboard(cards=game["cards"], game_over=True, is_win=is_win)
+    reply_markup = build_joker_keyboard(owner_id, cards=game["cards"], game_over=True, is_win=is_win)
     del active_joker_games[game_key]
 
     await callback.message.edit_text(
@@ -829,13 +887,19 @@ async def callback_joker_click(callback: types.CallbackQuery):
     await callback.answer(alert_text)
 
 
-@dp.callback_query(F.data == "joker_cancel")
+@dp.callback_query(F.data.startswith("joker_can:"))
 async def callback_joker_cancel(callback: types.CallbackQuery):
-    game_key = (callback.message.chat.id, callback.from_user.id)
+    owner_id = int(callback.data.split(":")[1])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = (callback.message.chat.id, owner_id)
     game = active_joker_games.get(game_key)
 
     if not game:
-        await callback.answer("Эта игра завершена или принадлежит не вам!", show_alert=True)
+        await callback.answer("Эта игра завершена!", show_alert=True)
         return
 
     await update_balance(game["user_id"], game["bet"])
@@ -846,12 +910,12 @@ async def callback_joker_cancel(callback: types.CallbackQuery):
     await callback.answer("Игра отменена")
 
 
-@dp.callback_query(F.data == "joker_disabled")
+@dp.callback_query(F.data.startswith("joker_dis:"))
 async def callback_joker_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 # ----------------------------------------------------
-# 7. РУЛЕТКА 🎰
+# 8. РУЛЕТКА 🎰
 # ----------------------------------------------------
 @dp.message(F.text.lower().in_(["отменить", "/отменить"]))
 async def roulette_cancel(message: types.Message):
@@ -1011,11 +1075,11 @@ async def roulette_spin(message: types.Message):
     )
 
 # ----------------------------------------------------
-# 8. ЗАПУСК
+# 9. ЗАПУСК
 # ----------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
-    print("🚀 Запуск бота GHRAM...")
+    print("🚀 Запуск обновленного бота GHRAM...")
     await init_db()
     await dp.start_polling(bot)
 
