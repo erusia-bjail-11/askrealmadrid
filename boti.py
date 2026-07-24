@@ -36,6 +36,7 @@ dp = Dispatcher()
 pending_posts = {}
 publish_queue = [] 
 last_publish_time = 0 
+recent_channel_posts = {}
 
 moderator_stats = {}
 
@@ -82,6 +83,17 @@ async def is_user_admin(user_id: int) -> bool:
         return member.status in ["creator", "administrator", "member"]
     except Exception:
         return False
+
+@dp.message(F.chat.id == COMMENTS_CHAT_ID, F.is_automatic_forward)
+async def catch_auto_forward(message: types.Message):
+    orig_id = None
+    if message.forward_from_message_id:
+        orig_id = message.forward_from_message_id
+    elif message.forward_origin and hasattr(message.forward_origin, 'message_id'):
+        orig_id = message.forward_origin.message_id
+    
+    if orig_id:
+        recent_channel_posts[orig_id] = message.message_id
 
 async def publish_post_data(data):
     """Функция непосредственной публикации поста в канал"""
@@ -134,6 +146,14 @@ async def publish_post_data(data):
         except Exception as e:
             logging.error(f"Ошибка создания опроса: {e}")
 
+        # Ожидаем автоматическую пересылку поста в чат комментариев
+        comment_msg_id = None
+        for _ in range(6):
+            if message_id in recent_channel_posts:
+                comment_msg_id = recent_channel_posts.pop(message_id)
+                break
+            await asyncio.sleep(0.5)
+
         channel_id_clean = str(CHANNEL_ID)[4:]
         post_link = f"https://t.me/c/{channel_id_clean}/{message_id}"
 
@@ -148,13 +168,23 @@ async def publish_post_data(data):
         ]])
 
         try:
-            await bot.send_message(
-                chat_id=COMMENTS_CHAT_ID,
-                text=comment_text,
-                parse_mode="HTML",
-                reply_markup=kb_comment,
-                disable_web_page_preview=False
-            )
+            if comment_msg_id:
+                await bot.send_message(
+                    chat_id=COMMENTS_CHAT_ID,
+                    text=comment_text,
+                    parse_mode="HTML",
+                    reply_markup=kb_comment,
+                    reply_to_message_id=comment_msg_id,
+                    disable_web_page_preview=False
+                )
+            else:
+                await bot.send_message(
+                    chat_id=COMMENTS_CHAT_ID,
+                    text=comment_text,
+                    parse_mode="HTML",
+                    reply_markup=kb_comment,
+                    disable_web_page_preview=False
+                )
         except Exception as e:
             logging.error(f"Ошибка отправки комментария: {e}")
 
