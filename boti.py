@@ -383,29 +383,7 @@ async def reject_item(callback: types.CallbackQuery):
     await bot.send_message(MOD_CHAT_ID, "⛔ Публикация отменена.", message_thread_id=MOD_THREAD_ID)
     await callback.answer("Отменено")
 
-@dp.callback_query(F.data.startswith("publish_"))
-async def publish_item(callback: types.CallbackQuery):
-    post_id = callback.data.replace("publish_", "")
-    data = pending_posts.get(post_id)
-    if not data:
-        await callback.answer("Ошибка: пост уже в очереди!", show_alert=True)
-        try: await callback.message.delete()
-        except: pass
-        return
-
-    publish_queue.append(data)
-    moderator_stats[callback.from_user.id] = moderator_stats.get(callback.from_user.id, 0) + 1
-    
-    try:
-        await callback.message.delete()
-        text = f"⏳ Пост от {callback.from_user.first_name} в очереди (5 мин)."
-        await bot.send_message(MOD_CHAT_ID, text, message_thread_id=MOD_THREAD_ID)
-    except TelegramBadRequest:
-        pass
-
-    del pending_posts[post_id]
-    await callback.answer("✅ Добавлено в очередь!")
-
+# Помещаем publish_now_ перед publish_, чтобы он проверялся первым
 @dp.callback_query(F.data.startswith("publish_now_"))
 async def publish_now_item(callback: types.CallbackQuery):
     post_id = callback.data.replace("publish_now_", "")
@@ -435,6 +413,29 @@ async def publish_now_item(callback: types.CallbackQuery):
     except Exception as e:
         logging.error(f"Ошибка немедленной публикации: {e}")
         await callback.answer("❌ Ошибка при публикации!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("publish_"))
+async def publish_item(callback: types.CallbackQuery):
+    post_id = callback.data.replace("publish_", "")
+    data = pending_posts.get(post_id)
+    if not data:
+        await callback.answer("Ошибка: пост уже в очереди!", show_alert=True)
+        try: await callback.message.delete()
+        except: pass
+        return
+
+    publish_queue.append(data)
+    moderator_stats[callback.from_user.id] = moderator_stats.get(callback.from_user.id, 0) + 1
+    
+    try:
+        await callback.message.delete()
+        text = f"⏳ Пост от {callback.from_user.first_name} в очереди (5 мин)."
+        await bot.send_message(MOD_CHAT_ID, text, message_thread_id=MOD_THREAD_ID)
+    except TelegramBadRequest:
+        pass
+
+    del pending_posts[post_id]
+    await callback.answer("✅ Добавлено в очередь!")
 
 @dp.callback_query(F.data == "cancel")
 async def cancel_reg(callback: types.CallbackQuery, state: FSMContext):
