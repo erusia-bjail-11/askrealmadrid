@@ -43,6 +43,10 @@ active_joker_games = {}
 # Список пользователей с включенным X-Ray режимом
 xray_users = set()
 
+# Активные и ожидающие дуэли
+pending_duels = {}
+active_duels = {}
+
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 BLACK_NUMBERS = {2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35}
 
@@ -638,55 +642,291 @@ async def transfer_money(message: types.Message):
         parse_mode="Markdown"
     )
 
-# --- ДУЭЛЬ ---
+# --- ИНТЕРАКТИВНАЯ ДУЭЛЬ ---
 @dp.message(F.text.lower().startswith(("/дуэль", "дуэль")))
 async def make_duel(message: types.Message):
     sender = await get_or_create_user(message.from_user.id, message.from_user.username)
-    
-    if not message.reply_to_message:
-        await message.reply("⚔️ Чтобы вызвать на дуэль, напишите `дуэль [сумма]` в ответ на сообщение соперника!")
-        return
-
-    target_id = message.reply_to_message.from_user.id
-    if target_id == sender['tg_id']:
-        await message.reply("❌ Нельзя драться с самим собой!")
-        return
-
     parts = message.text.split()
+
+    target_user = None
     bet = 100.0
-    if len(parts) > 1:
-        parsed = parse_amount(parts[1], sender['balance'])
+
+    if message.reply_to_message:
+        if len(parts) >= 2:
+            parsed = parse_amount(parts[1], sender['balance'])
+            if parsed:
+                bet = parsed
+        target_id = message.reply_to_message.from_user.id
+        target_user = await get_or_create_user(target_id, message.reply_to_message.from_user.username)
+    elif len(parts) >= 3:
+        target_identifier = parts[1]
+        parsed = parse_amount(parts[2], sender['balance'])
         if parsed:
             bet = parsed
+        target_user = await get_user_by_identifier(target_identifier)
+        if not target_user:
+            await message.reply("❌ Пользователь не найден в базе данных бота!")
+            return
+    elif len(parts) == 2:
+        target_user = await get_user_by_identifier(parts[1])
+        if not target_user:
+            await message.reply("❌ Пользователь не найден в базе данных бота!")
+            return
+    else:
+        await message.reply("⚔️ Чтобы вызвать на дуэль, напишите `дуэль [@username/ID] [сумма]` или ответьте на сообщение!")
+        return
 
     if bet <= 0:
         await message.reply("❌ Ставка должна быть больше 0.")
         return
 
-    recipient = await get_or_create_user(target_id, message.reply_to_message.from_user.username)
+    if target_user['tg_id'] == sender['tg_id']:
+        await message.reply("❌ Нельзя вызывать на дуэль самого себя!")
+        return
 
     if not check_balance(sender['tg_id'], sender['balance'], bet):
         await message.reply(f"❌ У вас недостаточно монет для дуэли (нужно {bet:,.2f}).")
         return
-    if not check_balance(recipient['tg_id'], recipient['balance'], bet):
+
+    if not check_balance(target_user['tg_id'], target_user['balance'], bet):
         await message.reply(f"❌ У соперника недостаточно монет (нужно {bet:,.2f}).")
         return
 
-    # Истинный рандом выбор победителя
-    winner, loser = secrets.choice([(sender, recipient), (recipient, sender)])
-    
-    await update_balance(winner['tg_id'], bet)
-    await update_balance(loser['tg_id'], -bet)
+    for d in list(pending_duels.values()) + list(active_duels.values()):
+        if d['chat_id'] == message.chat.id and (sender['tg_id'] in (d.get('p1_id'), d.get('p2_id'), d.get('challenger_id'), d.get('target_id')) or target_user['tg_id'] in (d.get('p1_id'), d.get('p2_id'), d.get('challenger_id'), d.get('target_id'))):
+            await message.reply("❌ Один из участников уже находится в активной дуэли!")
+            return
 
-    await add_history(winner['tg_id'], "Победа в дуэли", bet)
-    await add_history(loser['tg_id'], "Поражение в дуэли", -bet)
+    await update_balance(sender['tg_id'], -bet)
 
-    await message.reply(
-        f"⚔️ **Дуэль состоялась!**\n\n"
-        f"👑 Победитель: @{winner['username']} (+{bet:,.2f} монет)\n"
-        f"💀 Проигравший: @{loser['username']} (-{bet:,.2f} монет)",
-        parse_mode="Markdown"
+    duel_id = secrets.token_hex(4)
+    target_mention = f"@{target_user['username']}" if target_user['username'] and target_user['username'] != "Неизвестно" else f"ID {target_user['tg_id']}"
+    sender_mention = f"@{sender['username']}" if sender['username'] and sender['username'] != "Неизвестно" else f"ID {sender['tg_id']}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Согласиться ✅", callback_data=f"duel_acc:{duel_id}"),
+        InlineKeyboardButton(text="Отказаться ⛔", callback_data=f"duel_dec:{duel_id}")
+    ]])
+
+    sent_msg = await message.answer(
+        f"{target_mention}, вас вызвали на дуэль 🥳\n"
+        f"👤 Инициатор: {sender_mention}\n"
+        f"💰 Ставка: **{bet:,.2f}** монет",
+        reply_markup=kb
     )
+
+    async def invite_timeout():
+        await asyncio.sleep(180)
+        if duel_id in pending_duels:
+            d = pending_duels.pop(duel_id, None)
+            if d:
+                await update_balance(d['challenger_id'], d['bet'])
+                try:
+                    await sent_msg.edit_text("⏳ Время ожидания ответа на дуэль истекло (3 мин). Дуэль отменена, ставка возвращена.")
+                except Exception:
+                    pass
+
+    timer_task = asyncio.create_task(invite_timeout())
+
+    pending_duels[duel_id] = {
+        "chat_id": message.chat.id,
+        "challenger_id": sender['tg_id'],
+        "challenger_name": sender_mention,
+        "target_id": target_user['tg_id'],
+        "target_name": target_mention,
+        "bet": bet,
+        "msg": sent_msg,
+        "timer_task": timer_task
+    }
+
+
+@dp.callback_query(F.data.startswith("duel_acc:"))
+async def callback_duel_accept(callback: types.CallbackQuery):
+    duel_id = callback.data.split(":")[1]
+    duel = pending_duels.get(duel_id)
+
+    if not duel:
+        await callback.answer("Эта дуэль больше неактивна!", show_alert=True)
+        return
+
+    if callback.from_user.id != duel["target_id"]:
+        await callback.answer("❌ Принять дуэль может только вызванный игрок!", show_alert=True)
+        return
+
+    target_user = await get_or_create_user(duel["target_id"], callback.from_user.username)
+    if not check_balance(target_user['tg_id'], target_user['balance'], duel['bet']):
+        await callback.answer("❌ У вас недостаточно монет для принятия дуэли!", show_alert=True)
+        return
+
+    duel["timer_task"].cancel()
+    del pending_duels[duel_id]
+
+    await update_balance(target_user['tg_id'], -duel['bet'])
+
+    p1 = (duel["challenger_id"], duel["challenger_name"])
+    p2 = (duel["target_id"], duel["target_name"])
+    first, second = secrets.choice([(p1, p2), (p2, p1)])
+
+    first_id, first_name = first
+    second_id, second_name = second
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔫 Выстрел", callback_data=f"duel_shot:{duel_id}")
+    ]])
+
+    msg_text = (
+        f"⚔️ **Дуэль началась!**\n"
+        f"💰 Ставка: **{duel['bet']:,.2f}** монет (банк {duel['bet'] * 2:,.2f})\n\n"
+        f"{first_name}, вам дано право на выстрел."
+    )
+
+    await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode="Markdown")
+    await callback.answer("Дуэль принята!")
+
+    async def shot_timeout(current_duel_id):
+        await asyncio.sleep(180)
+        if current_duel_id in active_duels:
+            ad = active_duels.pop(current_duel_id, None)
+            if ad:
+                await update_balance(ad["p1_id"], ad["bet"])
+                await update_balance(ad["p2_id"], ad["bet"])
+                try:
+                    await ad["msg"].edit_text("⏳ Время ожидания выстрела истекло (3 мин). Дуэль отменена, деньги возвращены.")
+                except Exception:
+                    pass
+
+    timer_task = asyncio.create_task(shot_timeout(duel_id))
+
+    active_duels[duel_id] = {
+        "chat_id": callback.message.chat.id,
+        "p1_id": first_id,
+        "p1_name": first_name,
+        "p2_id": second_id,
+        "p2_name": second_name,
+        "current_turn_id": first_id,
+        "bet": duel["bet"],
+        "msg": callback.message,
+        "timer_task": timer_task
+    }
+
+
+@dp.callback_query(F.data.startswith("duel_dec:"))
+async def callback_duel_decline(callback: types.CallbackQuery):
+    duel_id = callback.data.split(":")[1]
+    duel = pending_duels.get(duel_id)
+
+    if not duel:
+        await callback.answer("Эта дуэль больше неактивна!", show_alert=True)
+        return
+
+    if callback.from_user.id != duel["target_id"]:
+        await callback.answer("❌ Отклонить дуэль может только вызванный игрок!", show_alert=True)
+        return
+
+    duel["timer_task"].cancel()
+    del pending_duels[duel_id]
+
+    await update_balance(duel["challenger_id"], duel["bet"])
+    await callback.message.edit_text(f"⛔ {duel['target_name']} отклонил(а) дуэль. Ставка возвращена.")
+    await callback.answer("Дуэль отклонена")
+
+
+async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
+    duel = active_duels.get(duel_id)
+    if not duel:
+        return False, "Дуэль не найдена!"
+
+    if shooter_id != duel["current_turn_id"]:
+        return False, "❌ Сейчас не ваш черед стрелять!"
+
+    duel["timer_task"].cancel()
+
+    # Непредсказуемый криптографический рандом попадания
+    is_hit = secrets.choice([True, False])
+
+    shooter_name = duel["p1_name"] if shooter_id == duel["p1_id"] else duel["p2_name"]
+    next_id = duel["p2_id"] if shooter_id == duel["p1_id"] else duel["p1_id"]
+    next_name = duel["p2_name"] if shooter_id == duel["p1_id"] else duel["p1_name"]
+
+    if is_hit:
+        total_win = duel["bet"] * 2
+        await update_balance(shooter_id, total_win)
+
+        await add_history(shooter_id, "Победа в дуэли", total_win - duel["bet"])
+        await add_history(next_id, "Поражение в дуэли", -duel["bet"])
+
+        del active_duels[duel_id]
+
+        text = (
+            f"💥 {shooter_name} делает выстрел и... **ПОПАДАЕТ!** 🎯\n\n"
+            f"👑 Победитель: {shooter_name}\n"
+            f"💰 Выигрыш: **{total_win:,.2f}** монет!"
+        )
+
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.message.edit_text(text, parse_mode="Markdown")
+            await message_or_cb.answer("🎯 Попадание!")
+        else:
+            await message_or_cb.reply(text, parse_mode="Markdown")
+        return True, "Победа"
+    else:
+        duel["current_turn_id"] = next_id
+
+        async def shot_timeout(current_duel_id):
+            await asyncio.sleep(180)
+            if current_duel_id in active_duels:
+                ad = active_duels.pop(current_duel_id, None)
+                if ad:
+                    await update_balance(ad["p1_id"], ad["bet"])
+                    await update_balance(ad["p2_id"], ad["bet"])
+                    try:
+                        await ad["msg"].edit_text("⏳ Время ожидания выстрела истекло (3 мин). Дуэль отменена, деньги возвращены.")
+                    except Exception:
+                        pass
+
+        duel["timer_task"] = asyncio.create_task(shot_timeout(duel_id))
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="🔫 Выстрел", callback_data=f"duel_shot:{duel_id}")
+        ]])
+
+        text = (
+            f"💨 {shooter_name} делает выстрел и... **ПРОМАХИВАЕТСЯ!**\n\n"
+            f"{next_name}, вам дано право на выстрел."
+        )
+
+        if isinstance(message_or_cb, types.CallbackQuery):
+            await message_or_cb.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+            await message_or_cb.answer("💨 Промах!")
+        else:
+            sent = await message_or_cb.reply(text, reply_markup=kb, parse_mode="Markdown")
+            duel["msg"] = sent
+        return True, "Промах"
+
+
+@dp.callback_query(F.data.startswith("duel_shot:"))
+async def callback_duel_shot(callback: types.CallbackQuery):
+    duel_id = callback.data.split(":")[1]
+    success, msg = await process_duel_shot(duel_id, callback.from_user.id, callback)
+    if not success:
+        await callback.answer(msg, show_alert=True)
+
+
+@dp.message(F.text.lower().in_(["выстрел", "🔫 выстрел", "/shot"]))
+async def msg_duel_shot(message: types.Message):
+    found_duel_id = None
+    for d_id, d in active_duels.items():
+        if d["chat_id"] == message.chat.id and d["current_turn_id"] == message.from_user.id:
+            found_duel_id = d_id
+            break
+
+    if not found_duel_id:
+        in_duel = any(d["chat_id"] == message.chat.id and message.from_user.id in (d["p1_id"], d["p2_id"]) for d in active_duels.values())
+        if in_duel:
+            await message.reply("❌ Сейчас не ваш черед стрелять!")
+        return
+
+    await process_duel_shot(found_duel_id, message.from_user.id, message)
 
 # ----------------------------------------------------
 # 7. МИНИ-ИГРЫ (6 МИН + КРИПТО-РАНДОМ + АНТИ-ПЕРЕХВАТ)
@@ -1079,8 +1319,7 @@ async def roulette_spin(message: types.Message):
         await message.reply("🎰 Сначала сделайте ставку! Пример: `100 красное`.")
         return
 
-    # Использование cryptographically secure генератора secrets
-    num = secrets.randbelow(37)  # Выдает числа от 0 до 36 абсолютно непредсказуемо
+    num = secrets.randbelow(37)
     color = "🟢 Зеро" if num == 0 else ("🔴 Красное" if num in RED_NUMBERS else "⚫ Черное")
 
     total_win = 0.0
