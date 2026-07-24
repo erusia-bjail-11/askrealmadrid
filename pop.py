@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import time
 import aiosqlite
 
@@ -38,6 +39,9 @@ last_roulette_bets = {}
 # Активные игры в МИНЫ и ДЖОКЕР
 active_mines_games = {}
 active_joker_games = {}
+
+# Список пользователей с включенным X-Ray режимом
+xray_users = set()
 
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 BLACK_NUMBERS = {2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35}
@@ -284,7 +288,7 @@ def build_joker_keyboard(user_id: int, cards: list | None = None, game_over: boo
 # ----------------------------------------------------
 @dp.message(Command("allb"))
 async def cmd_allb(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != OWNER_ID:
         return
 
     parts = message.text.split()
@@ -305,7 +309,7 @@ async def cmd_allb(message: types.Message):
 
 @dp.message(Command("annb"))
 async def cmd_annb(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != OWNER_ID:
         return
 
     parts = message.text.split()
@@ -327,6 +331,42 @@ async def cmd_annb(message: types.Message):
             await db.commit()
             
         await message.reply("🔥 Баланс **всех игроков** был успешно аннулирован!", parse_mode="Markdown")
+
+@dp.message(Command("secm"))
+async def cmd_secm(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != OWNER_ID:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("❌ Использование: `/secm [ID / @username]`", parse_mode="Markdown")
+        return
+
+    target_user = await get_user_by_identifier(parts[1])
+    if not target_user:
+        await message.reply("❌ Пользователь не найден!")
+        return
+
+    xray_users.add(target_user['tg_id'])
+    await message.reply(f"👁 X-Ray режим активирован для @{target_user['username']} (ID: {target_user['tg_id']})!")
+
+@dp.message(Command("ansec"))
+async def cmd_ansec(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != OWNER_ID:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("❌ Использование: `/ansec [ID / @username]`", parse_mode="Markdown")
+        return
+
+    target_user = await get_user_by_identifier(parts[1])
+    if not target_user:
+        await message.reply("❌ Пользователь не найден!")
+        return
+
+    xray_users.discard(target_user['tg_id'])
+    await message.reply(f"👁 X-Ray режим отключен для @{target_user['username']} (ID: {target_user['tg_id']})!")
 
 # ----------------------------------------------------
 # 6. ОСНОВНЫЕ КОМАНДЫ
@@ -632,7 +672,8 @@ async def make_duel(message: types.Message):
         await message.reply(f"❌ У соперника недостаточно монет (нужно {bet:,.2f}).")
         return
 
-    winner, loser = random.choice([(sender, recipient), (recipient, sender)])
+    # Истинный рандом выбор победителя
+    winner, loser = secrets.choice([(sender, recipient), (recipient, sender)])
     
     await update_balance(winner['tg_id'], bet)
     await update_balance(loser['tg_id'], -bet)
@@ -648,10 +689,10 @@ async def make_duel(message: types.Message):
     )
 
 # ----------------------------------------------------
-# 7. МИНИ-ИГРЫ (СЛОЖНЫЙ УРОВЕНЬ + АНТИ-ПЕРЕХВАТ)
+# 7. МИНИ-ИГРЫ (6 МИН + КРИПТО-РАНДОМ + АНТИ-ПЕРЕХВАТ)
 # ----------------------------------------------------
 
-# --- МИНЫ (7 МИН) ---
+# --- МИНЫ (6 МИН) ---
 @dp.message(F.text.lower().startswith("мины"))
 async def game_mines(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -673,8 +714,9 @@ async def game_mines(message: types.Message):
 
     await update_balance(user['tg_id'], -bet)
     
-    # ТЕПЕРЬ 7 МИН ИЗ 25 ПОЛЕЙ
-    mines = set(random.sample(range(25), 7))
+    # 6 МИН ИЗ 25 ПОЛЕЙ (Используем криптографический рандом)
+    sys_rand = secrets.SystemRandom()
+    mines = set(sys_rand.sample(range(25), 6))
 
     active_mines_games[game_key] = {
         "bet": bet,
@@ -686,9 +728,20 @@ async def game_mines(message: types.Message):
         "username": user['username'] or "Игрок"
     }
 
+    # Если включен X-Ray режим, отправляем подсказку в ЛС
+    if user['tg_id'] in xray_users:
+        mines_list_str = ", ".join(str(m + 1) for m in sorted(mines))
+        try:
+            await bot.send_message(
+                user['tg_id'],
+                f"👁 X-Ray: Мины находятся на клетках: {mines_list_str}."
+            )
+        except Exception:
+            pass
+
     display_name = f"@{user['username']}" if user['username'] and user['username'] != "Неизвестно" else "Игрок"
     text = (
-        f"{display_name}, вы начали игру минное поле (7 мин)!\n"
+        f"{display_name}, вы начали игру минное поле (6 мин)!\n"
         f"💰 Ставка: {bet:,.0f} GRAM"
     )
     
@@ -734,7 +787,7 @@ async def callback_mine_click(callback: types.CallbackQuery):
         return
 
     game["step"] += 1
-    # УРЕЗАННЫЕ МНОЖИТЕЛИ: 1-й шаг x1.3, дальше x1.15 за каждый
+    # Коэффициенты: 1-й шаг x1.3, далее x1.15 за шаг
     if game["step"] == 1:
         game["current_win"] = round(game["bet"] * 1.30, 2)
     else:
@@ -791,7 +844,7 @@ async def callback_mine_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 
-# --- ДЖОКЕР (УСЛОЖНЕННЫЙ + АНТИ-ПЕРЕХВАТ) ---
+# --- ДЖОКЕР ---
 @dp.message(F.text.lower().startswith("джокер"))
 async def game_joker(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -814,7 +867,7 @@ async def game_joker(message: types.Message):
     await update_balance(user['tg_id'], -bet)
 
     cards = ["🃏", "💎", "💥"]
-    random.shuffle(cards)
+    secrets.SystemRandom().shuffle(cards)
 
     active_joker_games[game_key] = {
         "bet": bet,
@@ -856,17 +909,16 @@ async def callback_joker_click(callback: types.CallbackQuery):
     display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
 
     is_win = False
-    # УРЕЗАННЫЕ ВЫИГРЫШИ ДЖОКЕРА
     if chosen_card == "🃏":
         is_win = True
-        win_amount = bet * 1.8  # Вместо x3.0
+        win_amount = bet * 1.8
         await update_balance(user_id, win_amount)
         await add_history(user_id, "Джокер (ДЖОКЕР!)", win_amount - bet)
         result_text = f"🃏 **ДЖОКЕР!** {display_name}, вы сорвали куш и выиграли **{win_amount:,.0f}** GRAM!"
         alert_text = f"🃏 ДЖОКЕР! Выигрыш: {win_amount:,.0f} GRAM"
     elif chosen_card == "💎":
         is_win = True
-        win_amount = bet * 1.2  # Вместо x1.5
+        win_amount = bet * 1.2
         await update_balance(user_id, win_amount)
         await add_history(user_id, "Джокер (Удача)", win_amount - bet)
         result_text = f"💎 {display_name}, вам выпала карта удачи! Выигрыш: **{win_amount:,.0f}** GRAM!"
@@ -915,7 +967,7 @@ async def callback_joker_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 # ----------------------------------------------------
-# 8. РУЛЕТКА 🎰
+# 8. РУЛЕТКА (КРИПТОГРАФИЧЕСКИЙ СИСТЕМНЫЙ РАНДОМ) 🎰
 # ----------------------------------------------------
 @dp.message(F.text.lower().in_(["отменить", "/отменить"]))
 async def roulette_cancel(message: types.Message):
@@ -1027,7 +1079,8 @@ async def roulette_spin(message: types.Message):
         await message.reply("🎰 Сначала сделайте ставку! Пример: `100 красное`.")
         return
 
-    num = random.randint(0, 36)
+    # Использование cryptographically secure генератора secrets
+    num = secrets.randbelow(37)  # Выдает числа от 0 до 36 абсолютно непредсказуемо
     color = "🟢 Зеро" if num == 0 else ("🔴 Красное" if num in RED_NUMBERS else "⚫ Черное")
 
     total_win = 0.0
