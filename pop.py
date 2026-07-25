@@ -33,6 +33,9 @@ BONUS_AMOUNT = 4000.0  # Размер бонуса в GHRAM
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Глобальное соединение с базой данных (для максимальной скорости и надежности)
+bot_db: aiosqlite.Connection = None
+
 # Активные и прошлые ставки в рулетке
 active_roulette_bets = {}
 last_roulette_bets = {}
@@ -108,135 +111,253 @@ async def get_user_lang(chat_type: str, tg_id: int) -> str:
     if chat_type in ["group", "supergroup"]:
         return "ru"
         
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT language FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
-            row = await cursor.fetchone()
-            if row and row['language']:
-                return row['language']
+    async with bot_db.execute("SELECT language FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return row[0]
     return "ru"
 
 # ----------------------------------------------------
-# 3. РАБОТА С БАЗОЙ ДАННЫХ
+# 3. РАБОТА С БАЗОЙ ДАННЫХ (ИДЕАЛЬНАЯ АРХИТЕКТУРА)
 # ----------------------------------------------------
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id INTEGER PRIMARY KEY,
-                username TEXT,
-                balance REAL DEFAULT 1000.0,
-                bank REAL DEFAULT 0.0,
-                hourly_income REAL DEFAULT 150.0,
-                last_claim INTEGER DEFAULT 0,
-                last_bonus INTEGER DEFAULT 0,
-                language TEXT DEFAULT 'ru'
-            )
-        """)
-        
-        # Полная безопасная миграция всех колонок
-        user_columns = [
-            ("bank", "REAL DEFAULT 0.0"),
-            ("hourly_income", "REAL DEFAULT 150.0"),
-            ("last_claim", "INTEGER DEFAULT 0"),
-            ("last_bonus", "INTEGER DEFAULT 0"),
-            ("language", "TEXT DEFAULT 'ru'")
-        ]
-        for col_name, col_type in user_columns:
-            try:
-                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
-            except Exception:
-                pass
+    global bot_db
+    bot_db = await aiosqlite.connect(DB_NAME)
+    bot_db.row_factory = aiosqlite.Row
 
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                action TEXT,
-                amount REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+    # --- НАСТРОЙКИ SQLITE ДЛЯ МАКСИМАЛЬНОЙ НАДЕЖНОСТИ И СКОРОСТИ ---
+    await bot_db.execute("PRAGMA journal_mode=WAL")       # Защита от поломки при перезагрузке
+    await bot_db.execute("PRAGMA synchronous=NORMAL")     # Баланс скорости и безопасности
+    await bot_db.execute("PRAGMA busy_timeout=5000")      # Ожидание при одновременных запросах
+    await bot_db.execute("PRAGMA foreign_keys=ON")        # Контроль целостности
+    await bot_db.execute("PRAGMA cache_size=-10000")      # Увеличенный кэш в оперативной памяти
 
-        # Таблица для кредитов и займов
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS loans (
-                user_id INTEGER PRIMARY KEY,
-                amount REAL DEFAULT 0.0,
-                repayment_amount REAL DEFAULT 0.0,
-                created_at INTEGER DEFAULT 0
-            )
-        """)
+    await bot_db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance REAL DEFAULT 1000.0,
+            bank REAL DEFAULT 0.0,
+            hourly_income REAL DEFAULT 150.0,
+            last_claim INTEGER DEFAULT 0,
+            last_bonus INTEGER DEFAULT 0,
+            language TEXT DEFAULT 'ru'
+        )
+    """)
+    
+    # Безопасная миграция
+    user_columns = [
+        ("bank", "REAL DEFAULT 0.0"),
+        ("hourly_income", "REAL DEFAULT 150.0"),
+        ("last_claim", "INTEGER DEFAULT 0"),
+        ("last_bonus", "INTEGER DEFAULT 0"),
+        ("language", "TEXT DEFAULT 'ru'")
+    ]
+    for col_name, col_type in user_columns:
+        try:
+            await bot_db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+        except Exception:
+            pass
 
-        # Таблица для бизнеса: майнинг-ферма
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS mining_farms (
-                user_id INTEGER PRIMARY KEY,
-                level INTEGER DEFAULT 1,
-                gpu_count INTEGER DEFAULT 1,
-                last_collect INTEGER DEFAULT 0
-            )
-        """)
+    await bot_db.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            amount REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-        await db.commit()
+    await bot_db.execute("""
+        CREATE TABLE IF NOT EXISTS loans (
+            user_id INTEGER PRIMARY KEY,
+            amount REAL DEFAULT 0.0,
+            repayment_amount REAL DEFAULT 0.0,
+            created_at INTEGER DEFAULT 0
+        )
+    """)
+
+    await bot_db.execute("""
+        CREATE TABLE IF NOT EXISTS mining_farms (
+            user_id INTEGER PRIMARY KEY,
+            level INTEGER DEFAULT 1,
+            gpu_count INTEGER DEFAULT 1,
+            last_collect INTEGER DEFAULT 0
+        )
+    """)
+
+    await bot_db.execute("""
+        CREATE TABLE IF NOT EXISTS active_games (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_type TEXT NOT NULL,
+            game_key TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            bet REAL NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            UNIQUE(game_type, game_key, user_id)
+        )
+    """)
+
+    # --- ИНДЕКСЫ ДЛЯ МГНОВЕННОЙ РАБОТЫ ---
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance DESC)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id, id DESC)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_loans_user ON loans(user_id)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_farms_user ON mining_farms(user_id)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_type_key ON active_games(game_type, game_key)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_user ON active_games(user_id)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_created ON active_games(created_at)")
+
+    await bot_db.commit()
 
 async def get_or_create_user(tg_id: int, username: str | None = None):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
-            user = await cursor.fetchone()
-            
-        now = int(time.time())
-        if not user:
-            initial_balance = 10**18 if tg_id == OWNER_ID else 1000.0
-            await db.execute(
-                "INSERT INTO users (tg_id, username, balance, last_claim, last_bonus, language) VALUES (?, ?, ?, ?, 0, 'ru')",
-                (tg_id, username or "Неизвестно", initial_balance, now)
-            )
-            await db.commit()
-            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
-                user = await cursor.fetchone()
-        else:
-            if tg_id == OWNER_ID and user['balance'] < 10**17:
-                await db.execute("UPDATE users SET balance = ? WHERE tg_id = ?", (10**18, tg_id))
-                await db.commit()
-            if username and user['username'] != username:
-                await db.execute("UPDATE users SET username = ? WHERE tg_id = ?", (username, tg_id))
-                await db.commit()
-            
-        return user
+    now = int(time.time())
+    initial_balance = 10**18 if tg_id == OWNER_ID else 1000.0
+    
+    # INSERT OR IGNORE защищает от гонки состояний при одновременной регистрации
+    await bot_db.execute(
+        "INSERT OR IGNORE INTO users (tg_id, username, balance, last_claim, last_bonus, language) VALUES (?, ?, ?, ?, 0, 'ru')",
+        (tg_id, username or "Неизвестно", initial_balance, now)
+    )
+    
+    if tg_id == OWNER_ID:
+        await bot_db.execute("UPDATE users SET balance = ? WHERE tg_id = ? AND balance < ?", (10**18, tg_id, 10**17))
+        
+    if username:
+        await bot_db.execute("UPDATE users SET username = ? WHERE tg_id = ? AND username != ?", (username, tg_id, username))
+        
+    await bot_db.commit()
+    
+    async with bot_db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+        return await cursor.fetchone()
 
 async def get_user_by_identifier(identifier: str):
     identifier = identifier.strip()
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        if identifier.startswith("@"):
-            username = identifier[1:]
-            async with db.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)) as cursor:
-                return await cursor.fetchone()
-        elif identifier.isdigit():
-            tg_id = int(identifier)
-            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
-                return await cursor.fetchone()
-        else:
-            async with db.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (identifier,)) as cursor:
-                return await cursor.fetchone()
+    if identifier.startswith("@"):
+        username = identifier[1:]
+        async with bot_db.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)) as cursor:
+            return await cursor.fetchone()
+    elif identifier.isdigit():
+        tg_id = int(identifier)
+        async with bot_db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+            return await cursor.fetchone()
+    else:
+        async with bot_db.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (identifier,)) as cursor:
+            return await cursor.fetchone()
 
 async def update_balance(tg_id: int, amount: float):
     if tg_id == OWNER_ID and amount < 0:
         return
-
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id))
-        await db.commit()
+    await bot_db.execute("UPDATE users SET balance = balance + ? WHERE tg_id = ?", (amount, tg_id))
+    await bot_db.commit()
 
 async def add_history(user_id: int, action: str, amount: float):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT INTO history (user_id, action, amount) VALUES (?, ?, ?)",
-            (user_id, action, amount)
+    await bot_db.execute(
+        "INSERT INTO history (user_id, action, amount) VALUES (?, ?, ?)",
+        (user_id, action, amount)
+    )
+    await bot_db.commit()
+
+# --- ФУНКЦИИ ДЛЯ РАБОТЫ С АКТИВНЫМИ ИГРАМИ В БД ---
+
+async def _save_game(game_type: str, game_key: str, chat_id: int, user_id: int, bet: float):
+    try:
+        now = int(time.time())
+        await bot_db.execute(
+            """INSERT INTO active_games (game_type, game_key, chat_id, user_id, bet, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(game_type, game_key, user_id) DO UPDATE SET bet = ?""",
+            (game_type, game_key, chat_id, user_id, bet, now, bet)
         )
-        await db.commit()
+        await bot_db.commit()
+    except Exception as e:
+        logging.error(f"Failed to save game to DB: {e}")
+
+async def _remove_game(game_type: str, game_key: str):
+    try:
+        await bot_db.execute(
+            "DELETE FROM active_games WHERE game_type = ? AND game_key = ?",
+            (game_type, game_key)
+        )
+        await bot_db.commit()
+    except Exception as e:
+        logging.error(f"Failed to remove game from DB: {e}")
+
+async def cleanup_all_active_games():
+    refunded_count = 0
+    total_refunded = 0.0
+    try:
+        async with bot_db.execute("SELECT * FROM active_games") as cursor:
+            rows = await cursor.fetchall()
+        
+        for row in rows:
+            await update_balance(row['user_id'], row['bet'])
+            refunded_count += 1
+            total_refunded += row['bet']
+        
+        if rows:
+            await bot_db.execute("DELETE FROM active_games")
+            await bot_db.commit()
+    except Exception as e:
+        logging.error(f"Error during startup cleanup: {e}")
+    
+    if refunded_count > 0:
+        logging.info(f"Startup cleanup: refunded {refunded_count} games, total {total_refunded:,.2f} GHRAM")
+
+async def cleanup_stale_games():
+    stale_time = int(time.time()) - 1800
+    cleaned = 0
+    try:
+        async with bot_db.execute("SELECT * FROM active_games WHERE created_at < ?", (stale_time,)) as cursor:
+            rows = await cursor.fetchall()
+        
+        for row in rows:
+            await update_balance(row['user_id'], row['bet'])
+            cleaned += 1
+            
+            game_type = row['game_type']
+            chat_id = row['chat_id']
+            user_id = row['user_id']
+            game_key_str = row['game_key']
+            
+            if game_type == "mines":
+                active_mines_games.pop((chat_id, user_id), None)
+            elif game_type == "joker":
+                active_joker_games.pop((chat_id, user_id), None)
+            elif game_type == "crash":
+                game = active_crash_games.pop((chat_id, user_id), None)
+                if game and game.get('status') == 'flying':
+                    game['status'] = 'cancelled'
+            elif game_type == "roulette":
+                key = (chat_id, user_id)
+                if key in active_roulette_bets:
+                    active_roulette_bets[key] = []
+            elif game_type == "duel_pending":
+                d = pending_duels.pop(game_key_str, None)
+                if d:
+                    d['timer_task'].cancel()
+            elif game_type == "duel_active":
+                d = active_duels.pop(game_key_str, None)
+                if d:
+                    d['timer_task'].cancel()
+        
+        if rows:
+            await bot_db.execute("DELETE FROM active_games WHERE created_at < ?", (stale_time,))
+            await bot_db.commit()
+    except Exception as e:
+        logging.error(f"Error during stale games cleanup: {e}")
+    
+    if cleaned > 0:
+        logging.info(f"Periodic cleanup: cleaned {cleaned} stale games")
+
+async def periodic_cleanup_task():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            await cleanup_stale_games()
+        except Exception as e:
+            logging.error(f"Error in periodic cleanup: {e}")
 
 # ----------------------------------------------------
 # 4. КЛАВИАТУРЫ
@@ -354,9 +475,8 @@ async def cmd_allb(message: types.Message):
         await message.reply("❌ Укажите корректную сумму!")
         return
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE tg_id != ?", (parsed, OWNER_ID))
-        await db.commit()
+    await bot_db.execute("UPDATE users SET balance = balance + ? WHERE tg_id != ?", (parsed, OWNER_ID))
+    await bot_db.commit()
 
     await message.reply(f"✅ Всем пользователям начислено по `{parsed:,.2f}` монет!", parse_mode="Markdown")
 
@@ -373,15 +493,13 @@ async def cmd_annb(message: types.Message):
             await message.reply("❌ Пользователь не найден!")
             return
         
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET balance = 0 WHERE tg_id = ?", (target_user['tg_id'],))
-            await db.commit()
+        await bot_db.execute("UPDATE users SET balance = 0 WHERE tg_id = ?", (target_user['tg_id'],))
+        await bot_db.commit()
             
         await message.reply(f"🔥 Баланс пользователя @{target_user['username']} (ID: {target_user['tg_id']}) аннулирован!")
     else:
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET balance = 0 WHERE tg_id != ?", (OWNER_ID,))
-            await db.commit()
+        await bot_db.execute("UPDATE users SET balance = 0 WHERE tg_id != ?", (OWNER_ID,))
+        await bot_db.commit()
             
         await message.reply("🔥 Баланс **всех игроков** был успешно аннулирован!", parse_mode="Markdown")
 
@@ -440,39 +558,38 @@ async def cmd_gamb(message: types.Message):
     refund_amount = 0.0
     cancelled_games = 0
 
-    # 1. Завершение Мин
     for key in list(active_mines_games.keys()):
         if key[1] == target_id:
             game = active_mines_games.pop(key)
             refund_amount += game['bet']
             cancelled_games += 1
+            await _remove_game("mines", f"{key[0]}:{key[1]}")
 
-    # 2. Завершение Джокера
     for key in list(active_joker_games.keys()):
         if key[1] == target_id:
             game = active_joker_games.pop(key)
             refund_amount += game['bet']
             cancelled_games += 1
+            await _remove_game("joker", f"{key[0]}:{key[1]}")
 
-    # 3. Завершение Краша
     for key in list(active_crash_games.keys()):
         if key[1] == target_id:
             game = active_crash_games.pop(key)
             game['status'] = 'cancelled'
             refund_amount += game['bet']
             cancelled_games += 1
+            await _remove_game("crash", f"{key[0]}:{key[1]}")
 
-    # 4. Отмена ставок в Рулетке
     for key in list(active_roulette_bets.keys()):
         if key[1] == target_id:
             bets = active_roulette_bets.pop(key)
             refund_amount += sum(b['bet'] for b in bets)
             cancelled_games += 1
+            await _remove_game("roulette", f"{key[0]}:{key[1]}")
 
     if refund_amount > 0:
         await update_balance(target_id, refund_amount)
 
-    # 5. Отмена ожидающих дуэлей
     for d_id in list(pending_duels.keys()):
         d = pending_duels.get(d_id)
         if d and (d['challenger_id'] == target_id or d['target_id'] == target_id):
@@ -480,12 +597,12 @@ async def cmd_gamb(message: types.Message):
             d['timer_task'].cancel()
             await update_balance(d['challenger_id'], d['bet'])
             cancelled_games += 1
+            await _remove_game("duel_pending", d_id)
             try:
                 await d['msg'].edit_text("🚫 Дуэль отменена администратором.")
             except Exception:
                 pass
 
-    # 6. Отмена активных дуэлей
     for d_id in list(active_duels.keys()):
         d = active_duels.get(d_id)
         if d and (d['p1_id'] == target_id or d['p2_id'] == target_id):
@@ -494,6 +611,7 @@ async def cmd_gamb(message: types.Message):
             await update_balance(d['p1_id'], d['bet'])
             await update_balance(d['p2_id'], d['bet'])
             cancelled_games += 1
+            await _remove_game("duel_active", d_id)
             try:
                 await d['msg'].edit_text("🚫 Дуэль принудительно остановлена администратором. Ставки возвращены.")
             except Exception:
@@ -580,9 +698,8 @@ async def callback_set_language(callback: types.CallbackQuery):
 
     new_lang = callback.data.split(":")[1]
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET language = ? WHERE tg_id = ?", (new_lang, callback.from_user.id))
-        await db.commit()
+    await bot_db.execute("UPDATE users SET language = ? WHERE tg_id = ?", (new_lang, callback.from_user.id))
+    await bot_db.commit()
 
     if new_lang == "en":
         alert_msg = "✅ Language changed to English!"
@@ -613,9 +730,8 @@ async def process_bonus_claim(user_id: int, username: str | None) -> str:
     if time_passed >= BONUS_COOLDOWN:
         await update_balance(user['tg_id'], BONUS_AMOUNT)
         
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("UPDATE users SET last_bonus = ? WHERE tg_id = ?", (now, user['tg_id']))
-            await db.commit()
+        await bot_db.execute("UPDATE users SET last_bonus = ? WHERE tg_id = ?", (now, user['tg_id']))
+        await bot_db.commit()
             
         await add_history(user['tg_id'], "Получение бонуса", BONUS_AMOUNT)
         
@@ -676,13 +792,11 @@ async def show_profile(message: types.Message):
 # --- ИСТОРИЯ ---
 @dp.message(F.text.lower().in_(["/история", "история", "history"]))
 async def show_history(message: types.Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT action, amount, created_at FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 5",
-            (message.from_user.id,)
-        ) as cursor:
-            rows = await cursor.fetchall()
+    async with bot_db.execute(
+        "SELECT action, amount, created_at FROM history WHERE user_id = ? ORDER BY id DESC LIMIT 5",
+        (message.from_user.id,)
+    ) as cursor:
+        rows = await cursor.fetchall()
             
     if not rows:
         await message.reply("📜 Ваша история операций пока пуста.")
@@ -702,12 +816,10 @@ async def show_top(message: types.Message):
     if len(parts) > 1 and parts[1].isdigit():
         limit = min(int(parts[1]), 50)
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT tg_id, username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,)
-        ) as cursor:
-            users = await cursor.fetchall()
+    async with bot_db.execute(
+        "SELECT tg_id, username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,)
+    ) as cursor:
+        users = await cursor.fetchall()
 
     text = f"🏆 **Глобальный топ-{len(users)} игроков:**\n\n"
     medals = ["🥇", "🥈", "🥉"]
@@ -777,6 +889,79 @@ async def transfer_money(message: types.Message):
         f"✅ Вы успешно перевели `{amount:,.2f}` монет пользователю **{target_name}**!", 
         parse_mode="Markdown"
     )
+
+# --- КОМАНДА /стоп ДЛЯ ОТМЕНЫ ВСЕХ ИГР ---
+@dp.message(F.text.lower().in_(["/stop", "/стоп", "стоп", "stop", "прекратить", "/cancel", "/отмена"]))
+async def cmd_stop_all_games(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    key = (chat_id, user_id)
+    refunds = []
+
+    if key in active_mines_games:
+        game = active_mines_games.pop(key)
+        refunds.append((user_id, game['bet']))
+        await _remove_game("mines", f"{chat_id}:{user_id}")
+
+    if key in active_joker_games:
+        game = active_joker_games.pop(key)
+        refunds.append((user_id, game['bet']))
+        await _remove_game("joker", f"{chat_id}:{user_id}")
+
+    if key in active_crash_games:
+        game = active_crash_games.pop(key)
+        if game.get('status') == 'flying':
+            game['status'] = 'cancelled'
+        refunds.append((user_id, game['bet']))
+        await _remove_game("crash", f"{chat_id}:{user_id}")
+
+    if key in active_roulette_bets and active_roulette_bets[key]:
+        bets = active_roulette_bets[key]
+        total = sum(b['bet'] for b in bets)
+        refunds.append((user_id, total))
+        active_roulette_bets[key] = []
+        await _remove_game("roulette", f"{chat_id}:{user_id}")
+
+    for d_id in list(pending_duels.keys()):
+        d = pending_duels[d_id]
+        if d['challenger_id'] == user_id and d['chat_id'] == chat_id:
+            d['timer_task'].cancel()
+            pending_duels.pop(d_id)
+            refunds.append((user_id, d['bet']))
+            await _remove_game("duel_pending", d_id)
+            try:
+                await d['msg'].edit_text("🚫 Дуэль отменена. Ставка возвращена.")
+            except Exception:
+                pass
+            break
+
+    for d_id in list(active_duels.keys()):
+        d = active_duels[d_id]
+        if user_id in (d['p1_id'], d['p2_id']) and d['chat_id'] == chat_id:
+            d['timer_task'].cancel()
+            active_duels.pop(d_id)
+            refunds.append((d['p1_id'], d['bet']))
+            refunds.append((d['p2_id'], d['bet']))
+            await _remove_game("duel_active", d_id)
+            try:
+                await d['msg'].edit_text("🚫 Дуэль отменена. Ставки возвращены обоим игрокам.")
+            except Exception:
+                pass
+            break
+
+    if refunds:
+        for uid, amt in refunds:
+            await update_balance(uid, amt)
+        own_refund = sum(amt for uid, amt in refunds if uid == user_id)
+        if own_refund > 0:
+            await message.reply(
+                f"✅ Все ваши активные игры отменены.\n💰 Возвращено: `{own_refund:,.2f}` GHRAM.",
+                parse_mode="Markdown"
+            )
+        else:
+            await message.reply("✅ Активная дуэль отменена. Ставки возвращены обоим игрокам.")
+    else:
+        await message.reply("ℹ️ У вас нет активных игр для отмены.")
 
 # --- ИНТЕРАКТИВНАЯ ДУЭЛЬ ---
 @dp.message(F.text.lower().startswith(("/дуэль", "дуэль")))
@@ -851,12 +1036,15 @@ async def make_duel(message: types.Message):
         reply_markup=kb
     )
 
+    await _save_game("duel_pending", duel_id, message.chat.id, sender['tg_id'], bet)
+
     async def invite_timeout():
         await asyncio.sleep(180)
         if duel_id in pending_duels:
             d = pending_duels.pop(duel_id, None)
             if d:
                 await update_balance(d['challenger_id'], d['bet'])
+                await _remove_game("duel_pending", duel_id)
                 try:
                     await sent_msg.edit_text("⏳ Время ожидания ответа на дуэль истекло (3 мин). Дуэль отменена, ставка возвращена.")
                 except Exception:
@@ -896,6 +1084,7 @@ async def callback_duel_accept(callback: types.CallbackQuery):
 
     duel["timer_task"].cancel()
     del pending_duels[duel_id]
+    await _remove_game("duel_pending", duel_id)
 
     await update_balance(target_user['tg_id'], -duel['bet'])
 
@@ -919,6 +1108,9 @@ async def callback_duel_accept(callback: types.CallbackQuery):
     await callback.message.edit_text(msg_text, reply_markup=kb, parse_mode="Markdown")
     await callback.answer("Дуэль принята!")
 
+    await _save_game("duel_active", duel_id, callback.message.chat.id, first_id, duel['bet'])
+    await _save_game("duel_active", duel_id, callback.message.chat.id, second_id, duel['bet'])
+
     async def shot_timeout(current_duel_id):
         await asyncio.sleep(180)
         if current_duel_id in active_duels:
@@ -926,6 +1118,7 @@ async def callback_duel_accept(callback: types.CallbackQuery):
             if ad:
                 await update_balance(ad["p1_id"], ad["bet"])
                 await update_balance(ad["p2_id"], ad["bet"])
+                await _remove_game("duel_active", current_duel_id)
                 try:
                     await ad["msg"].edit_text("⏳ Время ожидания выстрела истекло (3 мин). Дуэль отменена, деньги возвращены.")
                 except Exception:
@@ -961,6 +1154,7 @@ async def callback_duel_decline(callback: types.CallbackQuery):
 
     duel["timer_task"].cancel()
     del pending_duels[duel_id]
+    await _remove_game("duel_pending", duel_id)
 
     await update_balance(duel["challenger_id"], duel["bet"])
     await callback.message.edit_text(f"⛔ {duel['target_name']} отклонил(а) дуэль. Ставка возвращена.")
@@ -991,6 +1185,7 @@ async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
         await add_history(next_id, "Поражение в дуэли", -duel["bet"])
 
         del active_duels[duel_id]
+        await _remove_game("duel_active", duel_id)
 
         text = (
             f"💥 {shooter_name} делает выстрел и... **ПОПАДАЕТ!** 🎯\n\n"
@@ -1014,6 +1209,7 @@ async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
                 if ad:
                     await update_balance(ad["p1_id"], ad["bet"])
                     await update_balance(ad["p2_id"], ad["bet"])
+                    await _remove_game("duel_active", current_duel_id)
                     try:
                         await ad["msg"].edit_text("⏳ Время ожидания выстрела истекло (3 мин). Дуэль отменена, деньги возвращены.")
                     except Exception:
@@ -1084,7 +1280,7 @@ async def game_mines(message: types.Message):
 
     game_key = (message.chat.id, message.from_user.id)
     if game_key in active_mines_games:
-        await message.reply("❌ У вас уже есть активная игра в мины! Закончите её.")
+        await message.reply("❌ У вас уже есть активная игра в мины! Закончите её или напишите `/стоп` для отмены.")
         return
 
     await update_balance(user['tg_id'], -bet)
@@ -1101,6 +1297,8 @@ async def game_mines(message: types.Message):
         "user_id": user['tg_id'],
         "username": user['username'] or "Игрок"
     }
+
+    await _save_game("mines", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], bet)
 
     if user['tg_id'] in xray_users:
         mines_list_str = ", ".join(str(m + 1) for m in sorted(mines))
@@ -1155,6 +1353,7 @@ async def callback_mine_click(callback: types.CallbackQuery):
             f"💰 Потеряно: {game['bet']:,.0f} GRAM"
         )
         del active_mines_games[game_key]
+        await _remove_game("mines", f"{callback.message.chat.id}:{owner_id}")
         await callback.message.edit_text(text, reply_markup=reply_markup)
         await callback.answer("💣 БАМ! Поражение!")
         return
@@ -1206,6 +1405,7 @@ async def callback_mine_take(callback: types.CallbackQuery):
     
     reply_markup = build_mines_keyboard(owner_id, game["opened"], game["mines"], game_over=True, is_win=True)
     del active_mines_games[game_key]
+    await _remove_game("mines", f"{callback.message.chat.id}:{owner_id}")
     
     await callback.message.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     await callback.answer(f"✅ Вы забрали {win_amount:,.2f} GRAM!")
@@ -1233,7 +1433,7 @@ async def game_joker(message: types.Message):
 
     game_key = (message.chat.id, message.from_user.id)
     if game_key in active_joker_games:
-        await message.reply("❌ У вас уже есть активная игра в Джокер!")
+        await message.reply("❌ У вас уже есть активная игра в Джокер! Напишите `/стоп` для отмены.")
         return
 
     await update_balance(user['tg_id'], -bet)
@@ -1247,6 +1447,8 @@ async def game_joker(message: types.Message):
         "user_id": user['tg_id'],
         "username": user['username'] or "Игрок"
     }
+
+    await _save_game("joker", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], bet)
 
     display_name = f"@{user['username']}" if user['username'] and user['username'] != "Неизвестно" else "Игрок"
     text = (
@@ -1302,6 +1504,7 @@ async def callback_joker_click(callback: types.CallbackQuery):
 
     reply_markup = build_joker_keyboard(owner_id, cards=game["cards"], game_over=True, is_win=is_win)
     del active_joker_games[game_key]
+    await _remove_game("joker", f"{callback.message.chat.id}:{owner_id}")
 
     await callback.message.edit_text(
         f"{display_name}, вы начали игру джокер!\n💰 Ставка: {bet:,.0f} GRAM\n\n{result_text}",
@@ -1328,6 +1531,7 @@ async def callback_joker_cancel(callback: types.CallbackQuery):
 
     await update_balance(game["user_id"], game["bet"])
     del active_joker_games[game_key]
+    await _remove_game("joker", f"{callback.message.chat.id}:{owner_id}")
 
     display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
     await callback.message.edit_text(f"❌ {display_name} отменил игру «Джокер». Ставка возвращена.")
@@ -1344,10 +1548,8 @@ async def callback_joker_disabled(callback: types.CallbackQuery):
 LOAN_INTEREST_RATE = 0.15  # 15% ставка по кредиту
 
 async def get_user_loan(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM loans WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
+    async with bot_db.execute("SELECT * FROM loans WHERE user_id = ?", (user_id,)) as cursor:
+        return await cursor.fetchone()
 
 @dp.message(F.text.lower().startswith(("кредит", "/credit", "займ", "/loan")))
 async def process_loan_cmd(message: types.Message):
@@ -1394,12 +1596,11 @@ async def process_loan_cmd(message: types.Message):
     repay_amount = requested * (1.0 + LOAN_INTEREST_RATE)
     now = int(time.time())
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
-            (user['tg_id'], requested, repay_amount, now)
-        )
-        await db.commit()
+    await bot_db.execute(
+        "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
+        (user['tg_id'], requested, repay_amount, now)
+    )
+    await bot_db.commit()
 
     await update_balance(user['tg_id'], requested)
     await add_history(user['tg_id'], "Получение кредита", requested)
@@ -1441,12 +1642,11 @@ async def process_loan_repay_cmd(message: types.Message):
     await update_balance(user['tg_id'], -pay_amount)
     new_due = due - pay_amount
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        if new_due <= 0.01:
-            await db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
-        else:
-            await db.execute("UPDATE loans SET repayment_amount = ? WHERE user_id = ?", (new_due, user['tg_id']))
-        await db.commit()
+    if new_due <= 0.01:
+        await bot_db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
+    else:
+        await bot_db.execute("UPDATE loans SET repayment_amount = ? WHERE user_id = ?", (new_due, user['tg_id']))
+    await bot_db.commit()
 
     await add_history(user['tg_id'], "Погашение кредита", -pay_amount)
 
@@ -1475,9 +1675,8 @@ async def callback_loan_pay_all(callback: types.CallbackQuery):
         return
 
     await update_balance(user['tg_id'], -due)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
-        await db.commit()
+    await bot_db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
+    await bot_db.commit()
 
     await add_history(user['tg_id'], "Погашение кредита (Полное)", -due)
     await callback.message.edit_text("🎉 **Вы полностью погасили свой кредит!**", parse_mode="Markdown")
@@ -1501,12 +1700,11 @@ async def callback_loan_take_fast(callback: types.CallbackQuery):
     repay_amount = requested * (1.0 + LOAN_INTEREST_RATE)
     now = int(time.time())
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
-            (user['tg_id'], requested, repay_amount, now)
-        )
-        await db.commit()
+    await bot_db.execute(
+        "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
+        (user['tg_id'], requested, repay_amount, now)
+    )
+    await bot_db.commit()
 
     await update_balance(user['tg_id'], requested)
     await add_history(user['tg_id'], "Получение кредита (Быстрый)", requested)
@@ -1554,21 +1752,14 @@ GPU_BASE_PRICE = 10000.0
 LVL_BASE_PRICE = 25000.0
 
 async def get_or_create_farm(user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM mining_farms WHERE user_id = ?", (user_id,)) as cursor:
-            farm = await cursor.fetchone()
-
-        now = int(time.time())
-        if not farm:
-            await db.execute(
-                "INSERT INTO mining_farms (user_id, level, gpu_count, last_collect) VALUES (?, 1, 1, ?)",
-                (user_id, now)
-            )
-            await db.commit()
-            async with db.execute("SELECT * FROM mining_farms WHERE user_id = ?", (user_id,)) as cursor:
-                farm = await cursor.fetchone()
-        return farm
+    now = int(time.time())
+    await bot_db.execute(
+        "INSERT OR IGNORE INTO mining_farms (user_id, level, gpu_count, last_collect) VALUES (?, 1, 1, ?)",
+        (user_id, now)
+    )
+    await bot_db.commit()
+    async with bot_db.execute("SELECT * FROM mining_farms WHERE user_id = ?", (user_id,)) as cursor:
+        return await cursor.fetchone()
 
 def calculate_farm_income(level: int, gpu_count: int, last_collect: int):
     now = int(time.time())
@@ -1616,9 +1807,8 @@ async def callback_farm_claim(callback: types.CallbackQuery):
         return
 
     now = int(time.time())
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE mining_farms SET last_collect = ? WHERE user_id = ?", (now, owner_id))
-        await db.commit()
+    await bot_db.execute("UPDATE mining_farms SET last_collect = ? WHERE user_id = ?", (now, owner_id))
+    await bot_db.commit()
 
     await update_balance(owner_id, uncollected)
     await add_history(owner_id, "Сбор дохода с майнинга", uncollected)
@@ -1668,12 +1858,11 @@ async def callback_farm_buy_gpu(callback: types.CallbackQuery):
 
     await update_balance(user['tg_id'], -gpu_cost + uncollected)
     
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE mining_farms SET gpu_count = gpu_count + 1, last_collect = ? WHERE user_id = ?",
-            (now, owner_id)
-        )
-        await db.commit()
+    await bot_db.execute(
+        "UPDATE mining_farms SET gpu_count = gpu_count + 1, last_collect = ? WHERE user_id = ?",
+        (now, owner_id)
+    )
+    await bot_db.commit()
 
     await callback.answer("🎉 Вы успешно купили новую видеокарту!", show_alert=True)
 
@@ -1718,12 +1907,11 @@ async def callback_farm_upgrade_lvl(callback: types.CallbackQuery):
 
     await update_balance(user['tg_id'], -lvl_cost + uncollected)
 
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
-            "UPDATE mining_farms SET level = level + 1, last_collect = ? WHERE user_id = ?",
-            (now, owner_id)
-        )
-        await db.commit()
+    await bot_db.execute(
+        "UPDATE mining_farms SET level = level + 1, last_collect = ? WHERE user_id = ?",
+        (now, owner_id)
+    )
+    await bot_db.commit()
 
     await callback.answer("🚀 Ваша майнинг-ферма успешно улучшена!", show_alert=True)
 
@@ -1807,7 +1995,7 @@ async def game_crash(message: types.Message):
 
     game_key = (message.chat.id, message.from_user.id)
     if game_key in active_crash_games:
-        await message.reply("❌ У вас уже есть запущенная игра в Краш!")
+        await message.reply("❌ У вас уже есть запущенная игра в Краш! Напишите `/стоп` для отмены.")
         return
 
     await update_balance(user['tg_id'], -bet)
@@ -1830,6 +2018,8 @@ async def game_crash(message: types.Message):
         "status": "flying",
         "auto_cashout": auto_cashout
     }
+
+    await _save_game("crash", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], bet)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="💰 ЗАБРАТЬ (1.00x)", callback_data=f"crash_out:{crash_id}:{user['tg_id']}")
@@ -1885,6 +2075,7 @@ async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types
                 except Exception:
                     pass
                 active_crash_games.pop(game_key, None)
+                await _remove_game("crash", f"{chat_id}:{user_id}")
                 break
 
             if current_mult >= game['crash_point']:
@@ -1901,6 +2092,7 @@ async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types
                 except Exception:
                     pass
                 active_crash_games.pop(game_key, None)
+                await _remove_game("crash", f"{chat_id}:{user_id}")
                 break
 
             curr_win = round(game['bet'] * current_mult, 2)
@@ -1922,6 +2114,7 @@ async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types
     except Exception as e:
         logging.error(f"Error in crash flight: {e}")
         active_crash_games.pop(game_key, None)
+        await _remove_game("crash", f"{chat_id}:{user_id}")
 
 @dp.callback_query(F.data.startswith("crash_out:"))
 async def callback_crash_out(callback: types.CallbackQuery):
@@ -1957,6 +2150,7 @@ async def callback_crash_out(callback: types.CallbackQuery):
     )
 
     active_crash_games.pop(game_key, None)
+    await _remove_game("crash", f"{callback.message.chat.id}:{owner_id}")
 
     try:
         await callback.message.edit_text(text, parse_mode="Markdown")
@@ -1974,6 +2168,7 @@ async def roulette_cancel(message: types.Message):
         total_refund = sum(b['bet'] for b in active_roulette_bets[key])
         await update_balance(message.from_user.id, total_refund)
         active_roulette_bets[key] = []
+        await _remove_game("roulette", f"{message.chat.id}:{message.from_user.id}")
         await message.reply(f"🚫 Все ваши ставки на этот раунд отменены. Возвращено: `{total_refund:,.2f}` монет.")
     else:
         await message.reply("❌ У вас нет активных ставок.")
@@ -2009,6 +2204,8 @@ async def roulette_double(message: types.Message):
     await update_balance(user['tg_id'], -add_req)
     for b in bets:
         b['bet'] *= 2
+    total_bet = sum(b['bet'] for b in bets)
+    await _save_game("roulette", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], total_bet)
     await message.reply("⚡ Все ваши ставки удвоены!")
 
 @dp.message(F.text.lower().in_(["повторить", "/повторить"]))
@@ -2028,6 +2225,7 @@ async def roulette_repeat(message: types.Message):
     await update_balance(user['tg_id'], -req)
     import copy
     active_roulette_bets[key] = copy.deepcopy(last)
+    await _save_game("roulette", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], req)
     await message.reply(f"🔄 Повторено {len(last)} ставок.")
 
 def is_roulette_bet(message: types.Message) -> bool:
@@ -2073,6 +2271,8 @@ async def roulette_place_bet(message: types.Message):
         active_roulette_bets[key] = []
     
     active_roulette_bets[key].append({"bet": bet, "type": bet_type})
+    total_bet = sum(b['bet'] for b in active_roulette_bets[key])
+    await _save_game("roulette", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], total_bet)
     await message.reply(f"✅ Принята ставка `{bet:,.2f}` монет на **{bet_type}**.\nНапишите `крутить` для запуска!", parse_mode="Markdown")
 
 @dp.message(F.text.lower().in_(["крутить", "го", "вращать", "/spin"]))
@@ -2114,6 +2314,7 @@ async def roulette_spin(message: types.Message):
     import copy
     last_roulette_bets[key] = copy.deepcopy(bets)
     active_roulette_bets[key] = []
+    await _remove_game("roulette", f"{message.chat.id}:{message.from_user.id}")
 
     if total_win > 0:
         await update_balance(message.from_user.id, total_win)
@@ -2134,10 +2335,21 @@ async def roulette_spin(message: types.Message):
 # 12. ЗАПУСК
 # ----------------------------------------------------
 async def main():
+    global bot_db
     logging.basicConfig(level=logging.INFO)
     print("🚀 Запуск обновленного бота GHRAM...")
     await init_db()
-    await dp.start_polling(bot)
+    
+    print("🧹 Очистка зависших игр и возврат ставок...")
+    await cleanup_all_active_games()
+    
+    asyncio.create_task(periodic_cleanup_task())
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if bot_db:
+            await bot_db.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
