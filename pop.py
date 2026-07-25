@@ -21,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 # 1. КОНФИГУРАЦИЯ И ВЛАДЕЛЕЦ
 # ----------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOK", "ТВОЙ_ТОКЕН_ПО_УМОЛЧАНИЮ_ЕСЛИ_НЕТ_ENV")
-OWNER_ID = 5480751648  # ID владельца сбесконечным балансом
+OWNER_ID = 5480751648  # ID владельца с бесконечным балансом
 ADMIN_IDS = [5480751648]  # Список Telegram ID админов, имеющих доступ к /allb и /annb
 
 DB_NAME = "bot.db"
@@ -134,15 +134,19 @@ async def init_db():
             )
         """)
         
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN last_bonus INTEGER DEFAULT 0")
-        except Exception:
-            pass
-
-        try:
-            await db.execute("ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'ru'")
-        except Exception:
-            pass
+        # Полная безопасная миграция всех колонок
+        user_columns = [
+            ("bank", "REAL DEFAULT 0.0"),
+            ("hourly_income", "REAL DEFAULT 150.0"),
+            ("last_claim", "INTEGER DEFAULT 0"),
+            ("last_bonus", "INTEGER DEFAULT 0"),
+            ("language", "TEXT DEFAULT 'ru'")
+        ]
+        for col_name, col_type in user_columns:
+            try:
+                await db.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS history (
@@ -312,7 +316,6 @@ def build_joker_keyboard(user_id: int, cards: list | None = None, game_over: boo
         keyboard = [line, [InlineKeyboardButton(text=bottom_symbol, callback_data=f"joker_dis:{user_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-# Клавиатура Майнинг-Фермы
 def build_mining_keyboard(user_id: int, gpu_cost: float, lvl_cost: float):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ Собрать прибыль", callback_data=f"farm_claim:{user_id}")],
@@ -323,7 +326,6 @@ def build_mining_keyboard(user_id: int, gpu_cost: float, lvl_cost: float):
         [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"farm_refresh:{user_id}")]
     ])
 
-# Клавиатура Кредита
 def build_loan_keyboard(user_id: int, has_loan: bool):
     if has_loan:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -975,7 +977,6 @@ async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
 
     duel["timer_task"].cancel()
 
-    # Непредсказуемый криптографический рандом попадания
     is_hit = secrets.choice([True, False])
 
     shooter_name = duel["p1_name"] if shooter_id == duel["p1_id"] else duel["p2_name"]
@@ -1063,10 +1064,10 @@ async def msg_duel_shot(message: types.Message):
     await process_duel_shot(found_duel_id, message.from_user.id, message)
 
 # ----------------------------------------------------
-# 7. МИНИ-ИГРЫ (6 МИН + КРИПТО-РАНДОМ + АНТИ-ПЕРЕХВАТ)
+# 7. МИНИ-ИГРЫ
 # ----------------------------------------------------
 
-# --- МИНЫ (6 МИН) ---
+# --- МИНЫ ---
 @dp.message(F.text.lower().startswith("мины"))
 async def game_mines(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -1088,7 +1089,6 @@ async def game_mines(message: types.Message):
 
     await update_balance(user['tg_id'], -bet)
     
-    # 6 МИН ИЗ 25 ПОЛЕЙ (Используем криптографический рандом)
     sys_rand = secrets.SystemRandom()
     mines = set(sys_rand.sample(range(25), 6))
 
@@ -1102,7 +1102,6 @@ async def game_mines(message: types.Message):
         "username": user['username'] or "Игрок"
     }
 
-    # Если включен X-Ray режим, отправляем подсказку в ЛС
     if user['tg_id'] in xray_users:
         mines_list_str = ", ".join(str(m + 1) for m in sorted(mines))
         try:
@@ -1161,7 +1160,6 @@ async def callback_mine_click(callback: types.CallbackQuery):
         return
 
     game["step"] += 1
-    # Коэффициенты: 1-й шаг x1.3, далее x1.15 за шаг
     if game["step"] == 1:
         game["current_win"] = round(game["bet"] * 1.30, 2)
     else:
@@ -1341,167 +1339,7 @@ async def callback_joker_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 # ----------------------------------------------------
-# 8. РУЛЕТКА (КРИПТОГРАФИЧЕСКИЙ СИСТЕМНЫЙ РАНДОМ) 🎰
-# ----------------------------------------------------
-@dp.message(F.text.lower().in_(["отменить", "/отменить"]))
-async def roulette_cancel(message: types.Message):
-    key = (message.chat.id, message.from_user.id)
-    if key in active_roulette_bets and active_roulette_bets[key]:
-        total_refund = sum(b['bet'] for b in active_roulette_bets[key])
-        await update_balance(message.from_user.id, total_refund)
-        active_roulette_bets[key] = []
-        await message.reply(f"🚫 Все ваши ставки на этот раунд отменены. Возвращено: `{total_refund:,.2f}` монет.")
-    else:
-        await message.reply("❌ У вас нет активных ставок.")
-
-@dp.message(F.text.lower().in_(["ставки", "/ставки"]))
-async def roulette_show_bets(message: types.Message):
-    key = (message.chat.id, message.from_user.id)
-    bets = active_roulette_bets.get(key, [])
-    if not bets:
-        await message.reply("🎰 В текущем раунде у вас нет сделанных ставок.")
-        return
-    text = "🎰 **Ваши ставки в текущем раунде:**\n\n"
-    for idx, b in enumerate(bets, 1):
-        text += f"{idx}. `{b['bet']:,.2f}` монет на **{b['type']}**\n"
-    text += "\nНапишите `крутить` чтобы запустить рулетку!"
-    await message.reply(text, parse_mode="Markdown")
-
-@dp.message(F.text.lower().in_(["удвоить", "/удвоить"]))
-async def roulette_double(message: types.Message):
-    key = (message.chat.id, message.from_user.id)
-    bets = active_roulette_bets.get(key, [])
-    if not bets:
-        await message.reply("❌ У вас нет ставок для удвоения.")
-        return
-    
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    add_req = sum(b['bet'] for b in bets)
-    
-    if not check_balance(user['tg_id'], user['balance'], add_req):
-        await message.reply(f"❌ Недостаточно средств для удвоения! Нужно еще `{add_req:,.2f}` монет.")
-        return
-
-    await update_balance(user['tg_id'], -add_req)
-    for b in bets:
-        b['bet'] *= 2
-    await message.reply("⚡ Все ваши ставки удвоены!")
-
-@dp.message(F.text.lower().in_(["повторить", "/повторить"]))
-async def roulette_repeat(message: types.Message):
-    key = (message.chat.id, message.from_user.id)
-    last = last_roulette_bets.get(key, [])
-    if not last:
-        await message.reply("❌ У вас нет предыдущих ставок для повтора.")
-        return
-
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    req = sum(b['bet'] for b in last)
-    if not check_balance(user['tg_id'], user['balance'], req):
-        await message.reply(f"❌ Недостаточно монет для повтора! Нужно `{req:,.2f}` монет.")
-        return
-
-    await update_balance(user['tg_id'], -req)
-    import copy
-    active_roulette_bets[key] = copy.deepcopy(last)
-    await message.reply(f"🔄 Повторено {len(last)} ставок.")
-
-@dp.message(F.text.regexp(r"^([^\s]+)\s+(.+)$"))
-async def roulette_place_bet(message: types.Message):
-    match = re.match(r"^([^\s]+)\s+(.+)$", message.text.strip().lower())
-    if not match:
-        return
-
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    bet_str = match.group(1)
-    bet_type = match.group(2).strip()
-
-    if bet_type in ["профиль", "баланс", "дуэль", "топ", "бонус", "о нас", "язык", "кредит", "займ", "майнинг", "ферма", "краш"]:
-        return
-
-    bet = parse_amount(bet_str, user['balance'])
-    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
-        return
-
-    is_valid = False
-    if bet_type in ["красное", "черное", "нечет", "чет", "odd", "even", "0"]:
-        is_valid = True
-    elif bet_type.isdigit() and 0 <= int(bet_type) <= 36:
-        is_valid = True
-    elif "-" in bet_type:
-        parts = bet_type.split("-")
-        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
-            if 0 <= int(parts[0]) <= int(parts[1]) <= 36:
-                is_valid = True
-
-    if not is_valid:
-        return
-
-    await update_balance(user['tg_id'], -bet)
-    key = (message.chat.id, message.from_user.id)
-    if key not in active_roulette_bets:
-        active_roulette_bets[key] = []
-    
-    active_roulette_bets[key].append({"bet": bet, "type": bet_type})
-    await message.reply(f"✅ Принята ставка `{bet:,.2f}` монет на **{bet_type}**.\nНапишите `крутить` для запуска!", parse_mode="Markdown")
-
-@dp.message(F.text.lower().in_(["крутить", "го", "вращать", "/spin"]))
-async def roulette_spin(message: types.Message):
-    key = (message.chat.id, message.from_user.id)
-    bets = active_roulette_bets.get(key, [])
-    if not bets:
-        await message.reply("🎰 Сначала сделайте ставку! Пример: `100 красное`.")
-        return
-
-    num = secrets.randbelow(37)
-    color = "🟢 Зеро" if num == 0 else ("🔴 Красное" if num in RED_NUMBERS else "⚫ Черное")
-
-    total_win = 0.0
-    total_bet = sum(b['bet'] for b in bets)
-
-    for b in bets:
-        bt = b['type']
-        amt = b['bet']
-        
-        if bt in ["красное", "red"] and num in RED_NUMBERS:
-            total_win += amt * 2
-        elif bt in ["черное", "black"] and num in BLACK_NUMBERS:
-            total_win += amt * 2
-        elif bt in ["чет", "even"] and num > 0 and num % 2 == 0:
-            total_win += amt * 2
-        elif bt in ["нечет", "odd"] and num % 2 == 1:
-            total_win += amt * 2
-        elif bt.isdigit() and int(bt) == num:
-            total_win += amt * 36
-        elif "-" in bt:
-            p = bt.split("-")
-            low, high = int(p[0]), int(p[1])
-            if low <= num <= high:
-                count = (high - low + 1)
-                mult = 36.0 / count
-                total_win += amt * mult
-
-    import copy
-    last_roulette_bets[key] = copy.deepcopy(bets)
-    active_roulette_bets[key] = []
-
-    if total_win > 0:
-        await update_balance(message.from_user.id, total_win)
-        await add_history(message.from_user.id, "Рулетка (Выигрыш)", total_win - total_bet)
-        res_text = f"🎉 **Вы выиграли {total_win:,.2f} монет!**"
-    else:
-        await add_history(message.from_user.id, "Рулетка (Проигрыш)", -total_bet)
-        res_text = f"❌ Вы потеряли {total_bet:,.2f} монет."
-
-    await message.reply(
-        f"🎰 **Рулетка крутится...**\n\n"
-        f"Выпало число: **{num}** ({color})\n\n"
-        f"{res_text}",
-        parse_mode="Markdown"
-    )
-
-# ----------------------------------------------------
-# 9. НОВАЯ ФУНКЦИЯ 1: КРЕДИТЫ И ЗАЙМЫ ПОД ПРОЦЕНТ 🏦
+# 8. КРЕДИТЫ И ЗАЙМЫ ПОД ПРОЦЕНТ 🏦
 # ----------------------------------------------------
 LOAN_INTEREST_RATE = 0.15  # 15% ставка по кредиту
 
@@ -1517,7 +1355,6 @@ async def process_loan_cmd(message: types.Message):
     parts = message.text.split()
     loan = await get_user_loan(user['tg_id'])
 
-    # 1. Запрос информации или выбор действия
     if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() in ["инфо", "статус", "info"]):
         if loan and loan['repayment_amount'] > 0:
             text = (
@@ -1540,7 +1377,6 @@ async def process_loan_cmd(message: types.Message):
             await message.reply(text, parse_mode="Markdown", reply_markup=build_loan_keyboard(user['tg_id'], False))
         return
 
-    # 2. Оформление нового кредита
     if loan and loan['repayment_amount'] > 0:
         await message.reply(f"❌ У вас уже есть непогашенный заем на сумму `{loan['repayment_amount']:,.2f}` GHRAM! Сначала погасите его.", parse_mode="Markdown")
         return
@@ -1712,7 +1548,7 @@ async def callback_loan_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновлено")
 
 # ----------------------------------------------------
-# 10. НОВАЯ ФУНКЦИЯ 2: БИЗНЕС МAЙНИНГ-ФЕРМА 💻⚡
+# 9. БИЗНЕС МAЙНИНГ-ФЕРМА 💻⚡
 # ----------------------------------------------------
 GPU_BASE_PRICE = 10000.0
 LVL_BASE_PRICE = 25000.0
@@ -1737,10 +1573,9 @@ async def get_or_create_farm(user_id: int):
 def calculate_farm_income(level: int, gpu_count: int, last_collect: int):
     now = int(time.time())
     elapsed_seconds = max(0, now - last_collect)
-    # Формула дохода: КАЖДАЯ GPU при уровне Level дает 350.0 GHRAM в час
     income_per_hour = level * gpu_count * 350.0
     accumulated = (income_per_hour / 3600.0) * elapsed_seconds
-    return income_per_hour, min(accumulated, income_per_hour * 24)  # Макс 24 часа сбора
+    return income_per_hour, min(accumulated, income_per_hour * 24)
 
 @dp.message(F.text.lower().startswith(("майнинг", "/mining", "ферма", "бизнес")))
 async def show_mining_farm(message: types.Message):
@@ -1790,7 +1625,6 @@ async def callback_farm_claim(callback: types.CallbackQuery):
 
     await callback.answer(f"✅ Успешно собрано {uncollected:,.2f} GHRAM!", show_alert=True)
 
-    # Обновляем сообщение
     farm = await get_or_create_farm(owner_id)
     user = await get_or_create_user(owner_id, callback.from_user.username)
     income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
@@ -1829,7 +1663,6 @@ async def callback_farm_buy_gpu(callback: types.CallbackQuery):
         await callback.answer(f"❌ Недостаточно средств! Нужно: {gpu_cost:,.0f} GHRAM", show_alert=True)
         return
 
-    # Автосбор при покупке
     _, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
     now = int(time.time())
 
@@ -1844,7 +1677,6 @@ async def callback_farm_buy_gpu(callback: types.CallbackQuery):
 
     await callback.answer("🎉 Вы успешно купили новую видеокарту!", show_alert=True)
 
-    # Обновляем UI
     farm = await get_or_create_farm(owner_id)
     income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
     new_gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
@@ -1881,7 +1713,6 @@ async def callback_farm_upgrade_lvl(callback: types.CallbackQuery):
         await callback.answer(f"❌ Недостаточно средств! Нужно: {lvl_cost:,.0f} GHRAM", show_alert=True)
         return
 
-    # Автосбор при покупке
     _, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
     now = int(time.time())
 
@@ -1896,7 +1727,6 @@ async def callback_farm_upgrade_lvl(callback: types.CallbackQuery):
 
     await callback.answer("🚀 Ваша майнинг-ферма успешно улучшена!", show_alert=True)
 
-    # Обновляем UI
     farm = await get_or_create_farm(owner_id)
     income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
     gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
@@ -1950,7 +1780,7 @@ async def callback_farm_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновлено")
 
 # ----------------------------------------------------
-# 11. НОВАЯ ФУНКЦИЯ 3: ИГРА КРАШ С РАСТУЩИМ КОЭФФИЦИЕНТОМ 🚀📈
+# 10. ИГРА КРАШ С РАСТУЩИМ КОЭФФИЦИЕНТОМ 🚀📈
 # ----------------------------------------------------
 @dp.message(F.text.lower().startswith(("краш", "/crash")))
 async def game_crash(message: types.Message):
@@ -1982,7 +1812,6 @@ async def game_crash(message: types.Message):
 
     await update_balance(user['tg_id'], -bet)
 
-    # Генерация случайной точки падения (Exponential crash curve)
     sys_rand = secrets.SystemRandom()
     r = sys_rand.uniform(0.01, 0.99)
     crash_point = round(max(1.01, 0.98 / (1.0 - r)), 2)
@@ -1998,7 +1827,7 @@ async def game_crash(message: types.Message):
         "bet": bet,
         "crash_point": crash_point,
         "current_multiplier": 1.00,
-        "status": "flying",  # flying, cashed_out, crashed
+        "status": "flying",
         "auto_cashout": auto_cashout
     }
 
@@ -2017,89 +1846,82 @@ async def game_crash(message: types.Message):
         reply_markup=kb
     )
 
-    # Фоновый таск полета ракеты
     asyncio.create_task(run_crash_flight(message.chat.id, user['tg_id'], crash_id, msg))
 
 async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types.Message):
     game_key = (chat_id, user_id)
-    
     current_mult = 1.00
     step_delay = 1.1
 
-    while True:
-        await asyncio.sleep(step_delay)
-        
-        game = active_crash_games.get(game_key)
-        if not game or game['crash_id'] != crash_id:
-            break
+    try:
+        while True:
+            await asyncio.sleep(step_delay)
+            
+            game = active_crash_games.get(game_key)
+            if not game or game['crash_id'] != crash_id or game['status'] != "flying":
+                break
 
-        if game['status'] != "flying":
-            break
-
-        # Растущий коэффициент
-        increment = round(random.uniform(0.05, 0.15) if current_mult < 2.0 else random.uniform(0.15, 0.40), 2)
-        current_mult = round(current_mult + increment, 2)
-        game['current_multiplier'] = current_mult
-
-        # Проверка Автовывода
-        if game['auto_cashout'] and current_mult >= game['auto_cashout'] and current_mult < game['crash_point']:
-            win = round(game['bet'] * game['auto_cashout'], 2)
-            game['status'] = "cashed_out"
-            await update_balance(user_id, win)
-            await add_history(user_id, f"Краш (Автовывод {game['auto_cashout']}x)", win - game['bet'])
+            increment = round(random.uniform(0.05, 0.15) if current_mult < 2.0 else random.uniform(0.15, 0.40), 2)
+            current_mult = round(current_mult + increment, 2)
+            game['current_multiplier'] = current_mult
 
             display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
+
+            if game['auto_cashout'] and current_mult >= game['auto_cashout'] and current_mult < game['crash_point']:
+                win = round(game['bet'] * game['auto_cashout'], 2)
+                game['status'] = "cashed_out"
+                await update_balance(user_id, win)
+                await add_history(user_id, f"Краш (Автовывод {game['auto_cashout']}x)", win - game['bet'])
+
+                text = (
+                    f"✅ **АВТОВЫВОД СРАБОТАЛ!**\n\n"
+                    f"👤 Игрок: {display_name}\n"
+                    f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
+                    f"🎯 Коэффициент: **{game['auto_cashout']:.2f}x**\n"
+                    f"🎉 Выигрыш: **{win:,.2f}** GHRAM"
+                )
+                try:
+                    await msg.edit_text(text, parse_mode="Markdown")
+                except Exception:
+                    pass
+                active_crash_games.pop(game_key, None)
+                break
+
+            if current_mult >= game['crash_point']:
+                game['status'] = "crashed"
+                await add_history(user_id, "Краш (Взрыв)", -game['bet'])
+
+                text = (
+                    f"💥 **РАКЕТА ВЗОРВАЛАСЬ НА {game['crash_point']:.2f}x!**\n\n"
+                    f"👤 Игрок: {display_name}\n"
+                    f"💰 Потеряно: `{game['bet']:,.2f}` GHRAM"
+                )
+                try:
+                    await msg.edit_text(text, parse_mode="Markdown")
+                except Exception:
+                    pass
+                active_crash_games.pop(game_key, None)
+                break
+
+            curr_win = round(game['bet'] * current_mult, 2)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=f"💰 ЗАБРАТЬ ({current_mult:.2f}x)", callback_data=f"crash_out:{crash_id}:{user_id}")
+            ]])
+
             text = (
-                f"✅ **АВТОВЫВОД СРАБОТАЛ!**\n\n"
+                f"🚀 **Ракета летит...**\n\n"
                 f"👤 Игрок: {display_name}\n"
                 f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
-                f"🎯 Коэффициент: **{game['auto_cashout']:.2f}x**\n"
-                f"🎉 Выигрыш: **{win:,.2f}** GHRAM"
+                f"📈 Коэффициент: **{current_mult:.2f}x**\n"
+                f"💵 Текущий выигрыш: `{curr_win:,.2f}` GHRAM"
             )
             try:
-                await msg.edit_text(text, parse_mode="Markdown")
+                await msg.edit_text(text, parse_mode="Markdown", reply_markup=kb)
             except Exception:
                 pass
-            del active_crash_games[game_key]
-            break
-
-        # Проверка КРАША
-        if current_mult >= game['crash_point']:
-            game['status'] = "crashed"
-            await add_history(user_id, "Краш (Взрыв)", -game['bet'])
-
-            display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
-            text = (
-                f"💥 **РАКЕТА ВЗОРВАЛАСЬ НА {game['crash_point']:.2f}x!**\n\n"
-                f"👤 Игрок: {display_name}\n"
-                f"💰 Потеряно: `{game['bet']:,.2f}` GHRAM"
-            )
-            try:
-                await msg.edit_text(text, parse_mode="Markdown")
-            except Exception:
-                pass
-            del active_crash_games[game_key]
-            break
-
-        # Обновление состояния полета
-        curr_win = round(game['bet'] * current_mult, 2)
-        display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
-        
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=f"💰 ЗАБРАТЬ ({current_mult:.2f}x)", callback_data=f"crash_out:{crash_id}:{user_id}")
-        ]])
-
-        text = (
-            f"🚀 **Ракета летит...**\n\n"
-            f"👤 Игрок: {display_name}\n"
-            f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
-            f"📈 Коэффициент: **{current_mult:.2f}x**\n"
-            f"💵 Текущий выигрыш: `{curr_win:,.2f}` GHRAM"
-        )
-        try:
-            await msg.edit_text(text, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            pass
+    except Exception as e:
+        logging.error(f"Error in crash flight: {e}")
+        active_crash_games.pop(game_key, None)
 
 @dp.callback_query(F.data.startswith("crash_out:"))
 async def callback_crash_out(callback: types.CallbackQuery):
@@ -2114,12 +1936,8 @@ async def callback_crash_out(callback: types.CallbackQuery):
     game_key = (callback.message.chat.id, owner_id)
     game = active_crash_games.get(game_key)
 
-    if not game or game['crash_id'] != crash_id:
+    if not game or game['crash_id'] != crash_id or game['status'] != "flying":
         await callback.answer("Эта игра уже завершена!", show_alert=True)
-        return
-
-    if game['status'] != "flying":
-        await callback.answer("Игра уже завершена!", show_alert=True)
         return
 
     mult = game['current_multiplier']
@@ -2138,13 +1956,179 @@ async def callback_crash_out(callback: types.CallbackQuery):
         f"🏆 Итоговый выигрыш: **{win:,.2f}** GHRAM"
     )
 
-    del active_crash_games[game_key]
+    active_crash_games.pop(game_key, None)
 
     try:
         await callback.message.edit_text(text, parse_mode="Markdown")
     except Exception:
         pass
     await callback.answer(f"🎉 Вы забрали {win:,.2f} GHRAM!")
+
+# ----------------------------------------------------
+# 11. РУЛЕТКА (УМНЫЙ ФИЛЬТР) 🎰
+# ----------------------------------------------------
+@dp.message(F.text.lower().in_(["отменить", "/отменить"]))
+async def roulette_cancel(message: types.Message):
+    key = (message.chat.id, message.from_user.id)
+    if key in active_roulette_bets and active_roulette_bets[key]:
+        total_refund = sum(b['bet'] for b in active_roulette_bets[key])
+        await update_balance(message.from_user.id, total_refund)
+        active_roulette_bets[key] = []
+        await message.reply(f"🚫 Все ваши ставки на этот раунд отменены. Возвращено: `{total_refund:,.2f}` монет.")
+    else:
+        await message.reply("❌ У вас нет активных ставок.")
+
+@dp.message(F.text.lower().in_(["ставки", "/ставки"]))
+async def roulette_show_bets(message: types.Message):
+    key = (message.chat.id, message.from_user.id)
+    bets = active_roulette_bets.get(key, [])
+    if not bets:
+        await message.reply("🎰 В текущем раунде у вас нет сделанных ставок.")
+        return
+    text = "🎰 **Ваши ставки в текущем раунде:**\n\n"
+    for idx, b in enumerate(bets, 1):
+        text += f"{idx}. `{b['bet']:,.2f}` монет на **{b['type']}**\n"
+    text += "\nНапишите `крутить` чтобы запустить рулетку!"
+    await message.reply(text, parse_mode="Markdown")
+
+@dp.message(F.text.lower().in_(["удвоить", "/удвоить"]))
+async def roulette_double(message: types.Message):
+    key = (message.chat.id, message.from_user.id)
+    bets = active_roulette_bets.get(key, [])
+    if not bets:
+        await message.reply("❌ У вас нет ставок для удвоения.")
+        return
+    
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    add_req = sum(b['bet'] for b in bets)
+    
+    if not check_balance(user['tg_id'], user['balance'], add_req):
+        await message.reply(f"❌ Недостаточно средств для удвоения! Нужно еще `{add_req:,.2f}` монет.")
+        return
+
+    await update_balance(user['tg_id'], -add_req)
+    for b in bets:
+        b['bet'] *= 2
+    await message.reply("⚡ Все ваши ставки удвоены!")
+
+@dp.message(F.text.lower().in_(["повторить", "/повторить"]))
+async def roulette_repeat(message: types.Message):
+    key = (message.chat.id, message.from_user.id)
+    last = last_roulette_bets.get(key, [])
+    if not last:
+        await message.reply("❌ У вас нет предыдущих ставок для повтора.")
+        return
+
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    req = sum(b['bet'] for b in last)
+    if not check_balance(user['tg_id'], user['balance'], req):
+        await message.reply(f"❌ Недостаточно монет для повтора! Нужно `{req:,.2f}` монет.")
+        return
+
+    await update_balance(user['tg_id'], -req)
+    import copy
+    active_roulette_bets[key] = copy.deepcopy(last)
+    await message.reply(f"🔄 Повторено {len(last)} ставок.")
+
+def is_roulette_bet(message: types.Message) -> bool:
+    if not message.text:
+        return False
+    parts = message.text.strip().lower().split(maxsplit=1)
+    if len(parts) != 2:
+        return False
+    
+    bet_str, bet_type = parts[0], parts[1]
+    
+    is_valid_type = False
+    if bet_type in ["красное", "черное", "red", "black", "нечет", "чет", "odd", "even", "0"]:
+        is_valid_type = True
+    elif bet_type.isdigit() and 0 <= int(bet_type) <= 36:
+        is_valid_type = True
+    elif "-" in bet_type:
+        p = bet_type.split("-")
+        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+            if 0 <= int(p[0]) <= int(p[1]) <= 36:
+                is_valid_type = True
+
+    if not is_valid_type:
+        return False
+
+    amt = parse_amount(bet_str)
+    return amt is not None and amt > 0
+
+@dp.message(is_roulette_bet)
+async def roulette_place_bet(message: types.Message):
+    parts = message.text.strip().lower().split(maxsplit=1)
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    bet_str, bet_type = parts[0], parts[1]
+
+    bet = parse_amount(bet_str, user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств для ставки!")
+        return
+
+    await update_balance(user['tg_id'], -bet)
+    key = (message.chat.id, message.from_user.id)
+    if key not in active_roulette_bets:
+        active_roulette_bets[key] = []
+    
+    active_roulette_bets[key].append({"bet": bet, "type": bet_type})
+    await message.reply(f"✅ Принята ставка `{bet:,.2f}` монет на **{bet_type}**.\nНапишите `крутить` для запуска!", parse_mode="Markdown")
+
+@dp.message(F.text.lower().in_(["крутить", "го", "вращать", "/spin"]))
+async def roulette_spin(message: types.Message):
+    key = (message.chat.id, message.from_user.id)
+    bets = active_roulette_bets.get(key, [])
+    if not bets:
+        await message.reply("🎰 Сначала сделайте ставку! Пример: `100 красное`.")
+        return
+
+    num = secrets.randbelow(37)
+    color = "🟢 Зеро" if num == 0 else ("🔴 Красное" if num in RED_NUMBERS else "⚫ Черное")
+
+    total_win = 0.0
+    total_bet = sum(b['bet'] for b in bets)
+
+    for b in bets:
+        bt = b['type']
+        amt = b['bet']
+        
+        if bt in ["красное", "red"] and num in RED_NUMBERS:
+            total_win += amt * 2
+        elif bt in ["черное", "black"] and num in BLACK_NUMBERS:
+            total_win += amt * 2
+        elif bt in ["чет", "even"] and num > 0 and num % 2 == 0:
+            total_win += amt * 2
+        elif bt in ["нечет", "odd"] and num % 2 == 1:
+            total_win += amt * 2
+        elif bt.isdigit() and int(bt) == num:
+            total_win += amt * 36
+        elif "-" in bt:
+            p = bt.split("-")
+            low, high = int(p[0]), int(p[1])
+            if low <= num <= high:
+                count = (high - low + 1)
+                mult = 36.0 / count
+                total_win += amt * mult
+
+    import copy
+    last_roulette_bets[key] = copy.deepcopy(bets)
+    active_roulette_bets[key] = []
+
+    if total_win > 0:
+        await update_balance(message.from_user.id, total_win)
+        await add_history(message.from_user.id, "Рулетка (Выигрыш)", total_win - total_bet)
+        res_text = f"🎉 **Вы выиграли {total_win:,.2f} монет!**"
+    else:
+        await add_history(message.from_user.id, "Рулетка (Проигрыш)", -total_bet)
+        res_text = f"❌ Вы потеряли {total_bet:,.2f} монет."
+
+    await message.reply(
+        f"🎰 **Рулетка крутится...**\n\n"
+        f"Выпало число: **{num}** ({color})\n\n"
+        f"{res_text}",
+        parse_mode="Markdown"
+    )
 
 # ----------------------------------------------------
 # 12. ЗАПУСК
