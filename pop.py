@@ -15,6 +15,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton
 )
+from aiogram.exceptions import TelegramBadRequest
 
 # ----------------------------------------------------
 # 1. КОНФИГУРАЦИЯ И ВЛАДЕЛЕЦ
@@ -39,6 +40,9 @@ last_roulette_bets = {}
 # Активные игры в МИНЫ и ДЖОКЕР
 active_mines_games = {}
 active_joker_games = {}
+
+# Активные игры в КРАШ
+active_crash_games = {}
 
 # Список пользователей с включенным X-Ray режимом
 xray_users = set()
@@ -149,6 +153,27 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Таблица для кредитов и займов
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS loans (
+                user_id INTEGER PRIMARY KEY,
+                amount REAL DEFAULT 0.0,
+                repayment_amount REAL DEFAULT 0.0,
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+
+        # Таблица для бизнеса: майнинг-ферма
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mining_farms (
+                user_id INTEGER PRIMARY KEY,
+                level INTEGER DEFAULT 1,
+                gpu_count INTEGER DEFAULT 1,
+                last_collect INTEGER DEFAULT 0
+            )
+        """)
+
         await db.commit()
 
 async def get_or_create_user(tg_id: int, username: str | None = None):
@@ -287,6 +312,28 @@ def build_joker_keyboard(user_id: int, cards: list | None = None, game_over: boo
         keyboard = [line, [InlineKeyboardButton(text=bottom_symbol, callback_data=f"joker_dis:{user_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+# Клавиатура Майнинг-Фермы
+def build_mining_keyboard(user_id: int, gpu_cost: float, lvl_cost: float):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Собрать прибыль", callback_data=f"farm_claim:{user_id}")],
+        [
+            InlineKeyboardButton(text=f"🛒 +1 GPU ({gpu_cost:,.0f})", callback_data=f"farm_buy_gpu:{user_id}"),
+            InlineKeyboardButton(text=f"⬆️ Уровень ({lvl_cost:,.0f})", callback_data=f"farm_upgrade_lvl:{user_id}")
+        ],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"farm_refresh:{user_id}")]
+    ])
+
+# Клавиатура Кредита
+def build_loan_keyboard(user_id: int, has_loan: bool):
+    if has_loan:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Погасить весь кредит", callback_data=f"loan_pay_all:{user_id}")],
+            [InlineKeyboardButton(text="🔄 Обновить статус", callback_data=f"loan_refresh:{user_id}")]
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Взять быстрый займ (50,000)", callback_data=f"loan_take_fast:{user_id}")]
+    ])
+
 # ----------------------------------------------------
 # 5. АДМИН-КОМАНДЫ
 # ----------------------------------------------------
@@ -371,6 +418,93 @@ async def cmd_ansec(message: types.Message):
 
     xray_users.discard(target_user['tg_id'])
     await message.reply(f"👁 X-Ray режим отключен для @{target_user['username']} (ID: {target_user['tg_id']})!")
+
+@dp.message(Command("gamb"))
+async def cmd_gamb(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS and message.from_user.id != OWNER_ID:
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.reply("❌ Использование: `/gamb [ID / @username]`", parse_mode="Markdown")
+        return
+
+    target_user = await get_user_by_identifier(parts[1])
+    if not target_user:
+        await message.reply("❌ Пользователь не найден!")
+        return
+
+    target_id = target_user['tg_id']
+    refund_amount = 0.0
+    cancelled_games = 0
+
+    # 1. Завершение Мин
+    for key in list(active_mines_games.keys()):
+        if key[1] == target_id:
+            game = active_mines_games.pop(key)
+            refund_amount += game['bet']
+            cancelled_games += 1
+
+    # 2. Завершение Джокера
+    for key in list(active_joker_games.keys()):
+        if key[1] == target_id:
+            game = active_joker_games.pop(key)
+            refund_amount += game['bet']
+            cancelled_games += 1
+
+    # 3. Завершение Краша
+    for key in list(active_crash_games.keys()):
+        if key[1] == target_id:
+            game = active_crash_games.pop(key)
+            game['status'] = 'cancelled'
+            refund_amount += game['bet']
+            cancelled_games += 1
+
+    # 4. Отмена ставок в Рулетке
+    for key in list(active_roulette_bets.keys()):
+        if key[1] == target_id:
+            bets = active_roulette_bets.pop(key)
+            refund_amount += sum(b['bet'] for b in bets)
+            cancelled_games += 1
+
+    if refund_amount > 0:
+        await update_balance(target_id, refund_amount)
+
+    # 5. Отмена ожидающих дуэлей
+    for d_id in list(pending_duels.keys()):
+        d = pending_duels.get(d_id)
+        if d and (d['challenger_id'] == target_id or d['target_id'] == target_id):
+            d = pending_duels.pop(d_id)
+            d['timer_task'].cancel()
+            await update_balance(d['challenger_id'], d['bet'])
+            cancelled_games += 1
+            try:
+                await d['msg'].edit_text("🚫 Дуэль отменена администратором.")
+            except Exception:
+                pass
+
+    # 6. Отмена активных дуэлей
+    for d_id in list(active_duels.keys()):
+        d = active_duels.get(d_id)
+        if d and (d['p1_id'] == target_id or d['p2_id'] == target_id):
+            d = active_duels.pop(d_id)
+            d['timer_task'].cancel()
+            await update_balance(d['p1_id'], d['bet'])
+            await update_balance(d['p2_id'], d['bet'])
+            cancelled_games += 1
+            try:
+                await d['msg'].edit_text("🚫 Дуэль принудительно остановлена администратором. Ставки возвращены.")
+            except Exception:
+                pass
+
+    if cancelled_games == 0:
+        await message.reply(f"ℹ️ У пользователя @{target_user['username']} нет активных игр.")
+    else:
+        await message.reply(
+            f"🛑 Все активные игры для @{target_user['username']} (ID: {target_id}) отменены.\n"
+            f"💰 Средства успешно возвращены игроку на баланс!",
+            parse_mode="Markdown"
+        )
 
 # ----------------------------------------------------
 # 6. ОСНОВНЫЕ КОМАНДЫ
@@ -1282,7 +1416,7 @@ async def roulette_place_bet(message: types.Message):
     bet_str = match.group(1)
     bet_type = match.group(2).strip()
 
-    if bet_type in ["профиль", "баланс", "дуэль", "топ", "бонус", "о нас", "язык"]:
+    if bet_type in ["профиль", "баланс", "дуэль", "топ", "бонус", "о нас", "язык", "кредит", "займ", "майнинг", "ферма", "краш"]:
         return
 
     bet = parse_amount(bet_str, user['balance'])
@@ -1367,7 +1501,653 @@ async def roulette_spin(message: types.Message):
     )
 
 # ----------------------------------------------------
-# 9. ЗАПУСК
+# 9. НОВАЯ ФУНКЦИЯ 1: КРЕДИТЫ И ЗАЙМЫ ПОД ПРОЦЕНТ 🏦
+# ----------------------------------------------------
+LOAN_INTEREST_RATE = 0.15  # 15% ставка по кредиту
+
+async def get_user_loan(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM loans WHERE user_id = ?", (user_id,)) as cursor:
+            return await cursor.fetchone()
+
+@dp.message(F.text.lower().startswith(("кредит", "/credit", "займ", "/loan")))
+async def process_loan_cmd(message: types.Message):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split()
+    loan = await get_user_loan(user['tg_id'])
+
+    # 1. Запрос информации или выбор действия
+    if len(parts) == 1 or (len(parts) == 2 and parts[1].lower() in ["инфо", "статус", "info"]):
+        if loan and loan['repayment_amount'] > 0:
+            text = (
+                f"🏦 **Ваш Банковский Кредит**\n\n"
+                f"👤 Заемщик: @{user['username']}\n"
+                f"💵 Начальная сумма: `{loan['amount']:,.2f}` GHRAM\n"
+                f"📈 Сумма к возврату (с 15% %): `{loan['repayment_amount']:,.2f}` GHRAM\n\n"
+                f"💡 Чтобы погасить кредит, напишите: `погасить [сумма]` или нажмите кнопку ниже."
+            )
+            await message.reply(text, parse_mode="Markdown", reply_markup=build_loan_keyboard(user['tg_id'], True))
+        else:
+            max_loan = 100000.0 + (user['hourly_income'] * 20)
+            text = (
+                f"🏦 **Банковский Центр Кредитования**\n\n"
+                f"Вы можете взять заем под **15%** годовых!\n"
+                f"📊 Ваш лимит кредита: `{max_loan:,.2f}` GHRAM\n\n"
+                f"✍️ Чтобы взять кредит, напишите: `кредит [сумма]`\n"
+                f"Например: `кредит 50000`"
+            )
+            await message.reply(text, parse_mode="Markdown", reply_markup=build_loan_keyboard(user['tg_id'], False))
+        return
+
+    # 2. Оформление нового кредита
+    if loan and loan['repayment_amount'] > 0:
+        await message.reply(f"❌ У вас уже есть непогашенный заем на сумму `{loan['repayment_amount']:,.2f}` GHRAM! Сначала погасите его.", parse_mode="Markdown")
+        return
+
+    requested = parse_amount(parts[1])
+    if not requested or requested <= 0:
+        await message.reply("❌ Укажите корректную сумму кредита! Пример: `кредит 50000`")
+        return
+
+    max_loan = 100000.0 + (user['hourly_income'] * 20)
+    if requested > max_loan and user['tg_id'] != OWNER_ID:
+        await message.reply(f"❌ Максимально доступная вам сумма кредита: `{max_loan:,.2f}` GHRAM!", parse_mode="Markdown")
+        return
+
+    repay_amount = requested * (1.0 + LOAN_INTEREST_RATE)
+    now = int(time.time())
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
+            (user['tg_id'], requested, repay_amount, now)
+        )
+        await db.commit()
+
+    await update_balance(user['tg_id'], requested)
+    await add_history(user['tg_id'], "Получение кредита", requested)
+
+    text = (
+        f"✅ **Кредит успешно одобрен!**\n\n"
+        f"💰 Начислено на баланс: `+{requested:,.2f}` GHRAM\n"
+        f"📊 Сумма к возврату (15%): `{repay_amount:,.2f}` GHRAM\n\n"
+        f"Погасить можно в любое время командой `погасить`!"
+    )
+    await message.reply(text, parse_mode="Markdown")
+
+@dp.message(F.text.lower().startswith(("погасить", "/repay")))
+async def process_loan_repay_cmd(message: types.Message):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    loan = await get_user_loan(user['tg_id'])
+
+    if not loan or loan['repayment_amount'] <= 0:
+        await message.reply("❌ У вас нет активных кредитов!")
+        return
+
+    parts = message.text.split()
+    due = loan['repayment_amount']
+
+    if len(parts) >= 2:
+        pay_amount = parse_amount(parts[1], user['balance'])
+        if not pay_amount or pay_amount <= 0:
+            await message.reply("❌ Неверно указана сумма для погашения!")
+            return
+    else:
+        pay_amount = due
+
+    pay_amount = min(pay_amount, due)
+
+    if not check_balance(user['tg_id'], user['balance'], pay_amount):
+        await message.reply(f"❌ Недостаточно средств на балансе! Требуется: `{pay_amount:,.2f}` GHRAM.", parse_mode="Markdown")
+        return
+
+    await update_balance(user['tg_id'], -pay_amount)
+    new_due = due - pay_amount
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        if new_due <= 0.01:
+            await db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
+        else:
+            await db.execute("UPDATE loans SET repayment_amount = ? WHERE user_id = ?", (new_due, user['tg_id']))
+        await db.commit()
+
+    await add_history(user['tg_id'], "Погашение кредита", -pay_amount)
+
+    if new_due <= 0.01:
+        await message.reply("🎉 **Вы полностью погасили свой кредит!** Ваш кредитный рейтинг укрепился.", parse_mode="Markdown")
+    else:
+        await message.reply(f"✅ Внесено `{pay_amount:,.2f}` GHRAM. Остаток по кредиту: `{new_due:,.2f}` GHRAM.", parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("loan_pay_all:"))
+async def callback_loan_pay_all(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваше меню!", show_alert=True)
+        return
+
+    user = await get_or_create_user(callback.from_user.id, callback.from_user.username)
+    loan = await get_user_loan(user['tg_id'])
+
+    if not loan or loan['repayment_amount'] <= 0:
+        await callback.answer("У вас нет активного кредита!", show_alert=True)
+        return
+
+    due = loan['repayment_amount']
+    if not check_balance(user['tg_id'], user['balance'], due):
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {due:,.2f} GHRAM", show_alert=True)
+        return
+
+    await update_balance(user['tg_id'], -due)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM loans WHERE user_id = ?", (user['tg_id'],))
+        await db.commit()
+
+    await add_history(user['tg_id'], "Погашение кредита (Полное)", -due)
+    await callback.message.edit_text("🎉 **Вы полностью погасили свой кредит!**", parse_mode="Markdown")
+    await callback.answer("Кредит полностью погашен!")
+
+@dp.callback_query(F.data.startswith("loan_take_fast:"))
+async def callback_loan_take_fast(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваше меню!", show_alert=True)
+        return
+
+    user = await get_or_create_user(callback.from_user.id, callback.from_user.username)
+    loan = await get_user_loan(user['tg_id'])
+
+    if loan and loan['repayment_amount'] > 0:
+        await callback.answer("У вас уже есть активный кредит!", show_alert=True)
+        return
+
+    requested = 50000.0
+    repay_amount = requested * (1.0 + LOAN_INTEREST_RATE)
+    now = int(time.time())
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO loans (user_id, amount, repayment_amount, created_at) VALUES (?, ?, ?, ?)",
+            (user['tg_id'], requested, repay_amount, now)
+        )
+        await db.commit()
+
+    await update_balance(user['tg_id'], requested)
+    await add_history(user['tg_id'], "Получение кредита (Быстрый)", requested)
+
+    text = (
+        f"✅ **Быстрый заем оформлен!**\n\n"
+        f"💰 Начислено: `+{requested:,.2f}` GHRAM\n"
+        f"📊 Сумма к возврату: `{repay_amount:,.2f}` GHRAM"
+    )
+    await callback.message.edit_text(text, parse_mode="Markdown")
+    await callback.answer("Заем зачислен!")
+
+@dp.callback_query(F.data.startswith("loan_refresh:"))
+async def callback_loan_refresh(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваше меню!", show_alert=True)
+        return
+
+    user = await get_or_create_user(callback.from_user.id, callback.from_user.username)
+    loan = await get_user_loan(user['tg_id'])
+
+    if loan and loan['repayment_amount'] > 0:
+        text = (
+            f"🏦 **Ваш Банковский Кредит**\n\n"
+            f"👤 Заемщик: @{user['username']}\n"
+            f"💵 Начальная сумма: `{loan['amount']:,.2f}` GHRAM\n"
+            f"📈 Сумма к возврату (с 15% %): `{loan['repayment_amount']:,.2f}` GHRAM"
+        )
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_loan_keyboard(user['tg_id'], True))
+    else:
+        max_loan = 100000.0 + (user['hourly_income'] * 20)
+        text = (
+            f"🏦 **Банковский Центр Кредитования**\n\n"
+            f"Вы можете взять заем под **15%** годовых!\n"
+            f"📊 Ваш лимит кредита: `{max_loan:,.2f}` GHRAM"
+        )
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_loan_keyboard(user['tg_id'], False))
+    await callback.answer("Обновлено")
+
+# ----------------------------------------------------
+# 10. НОВАЯ ФУНКЦИЯ 2: БИЗНЕС МAЙНИНГ-ФЕРМА 💻⚡
+# ----------------------------------------------------
+GPU_BASE_PRICE = 10000.0
+LVL_BASE_PRICE = 25000.0
+
+async def get_or_create_farm(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM mining_farms WHERE user_id = ?", (user_id,)) as cursor:
+            farm = await cursor.fetchone()
+
+        now = int(time.time())
+        if not farm:
+            await db.execute(
+                "INSERT INTO mining_farms (user_id, level, gpu_count, last_collect) VALUES (?, 1, 1, ?)",
+                (user_id, now)
+            )
+            await db.commit()
+            async with db.execute("SELECT * FROM mining_farms WHERE user_id = ?", (user_id,)) as cursor:
+                farm = await cursor.fetchone()
+        return farm
+
+def calculate_farm_income(level: int, gpu_count: int, last_collect: int):
+    now = int(time.time())
+    elapsed_seconds = max(0, now - last_collect)
+    # Формула дохода: КАЖДАЯ GPU при уровне Level дает 350.0 GHRAM в час
+    income_per_hour = level * gpu_count * 350.0
+    accumulated = (income_per_hour / 3600.0) * elapsed_seconds
+    return income_per_hour, min(accumulated, income_per_hour * 24)  # Макс 24 часа сбора
+
+@dp.message(F.text.lower().startswith(("майнинг", "/mining", "ферма", "бизнес")))
+async def show_mining_farm(message: types.Message):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    farm = await get_or_create_farm(user['tg_id'])
+
+    income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    
+    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+
+    text = (
+        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
+        f"👤 Владелец: @{user['username']}\n"
+        f"⚡ Уровень системы: **{farm['level']}**\n"
+        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
+        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
+        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
+        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
+        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+    )
+
+    kb = build_mining_keyboard(user['tg_id'], gpu_cost, lvl_cost)
+    await message.reply(text, parse_mode="Markdown", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("farm_claim:"))
+async def callback_farm_claim(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша ферма!", show_alert=True)
+        return
+
+    farm = await get_or_create_farm(owner_id)
+    _, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+
+    if uncollected < 1.0:
+        await callback.answer("⚡ Доход еще не успел накопиться! Подождите немного.", show_alert=True)
+        return
+
+    now = int(time.time())
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("UPDATE mining_farms SET last_collect = ? WHERE user_id = ?", (now, owner_id))
+        await db.commit()
+
+    await update_balance(owner_id, uncollected)
+    await add_history(owner_id, "Сбор дохода с майнинга", uncollected)
+
+    await callback.answer(f"✅ Успешно собрано {uncollected:,.2f} GHRAM!", show_alert=True)
+
+    # Обновляем сообщение
+    farm = await get_or_create_farm(owner_id)
+    user = await get_or_create_user(owner_id, callback.from_user.username)
+    income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    
+    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+
+    text = (
+        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
+        f"👤 Владелец: @{user['username']}\n"
+        f"⚡ Уровень системы: **{farm['level']}**\n"
+        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
+        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
+        f"🔋 **Незабранный майнинг:** `{new_uncollected:,.2f}` GHRAM\n"
+        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
+        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+    )
+    kb = build_mining_keyboard(owner_id, gpu_cost, lvl_cost)
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+@dp.callback_query(F.data.startswith("farm_buy_gpu:"))
+async def callback_farm_buy_gpu(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша ферма!", show_alert=True)
+        return
+
+    user = await get_or_create_user(owner_id, callback.from_user.username)
+    farm = await get_or_create_farm(owner_id)
+
+    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    if not check_balance(user['tg_id'], user['balance'], gpu_cost):
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {gpu_cost:,.0f} GHRAM", show_alert=True)
+        return
+
+    # Автосбор при покупке
+    _, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    now = int(time.time())
+
+    await update_balance(user['tg_id'], -gpu_cost + uncollected)
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE mining_farms SET gpu_count = gpu_count + 1, last_collect = ? WHERE user_id = ?",
+            (now, owner_id)
+        )
+        await db.commit()
+
+    await callback.answer("🎉 Вы успешно купили новую видеокарту!", show_alert=True)
+
+    # Обновляем UI
+    farm = await get_or_create_farm(owner_id)
+    income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    new_gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+
+    text = (
+        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
+        f"👤 Владелец: @{user['username']}\n"
+        f"⚡ Уровень системы: **{farm['level']}**\n"
+        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
+        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
+        f"🔋 **Незабранный майнинг:** `{new_uncollected:,.2f}` GHRAM\n"
+        f"🛒 Цена новой GPU: `{new_gpu_cost:,.0f}` GHRAM\n"
+        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+    )
+    kb = build_mining_keyboard(owner_id, new_gpu_cost, lvl_cost)
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+@dp.callback_query(F.data.startswith("farm_upgrade_lvl:"))
+async def callback_farm_upgrade_lvl(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша ферма!", show_alert=True)
+        return
+
+    user = await get_or_create_user(owner_id, callback.from_user.username)
+    farm = await get_or_create_farm(owner_id)
+
+    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+    if not check_balance(user['tg_id'], user['balance'], lvl_cost):
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {lvl_cost:,.0f} GHRAM", show_alert=True)
+        return
+
+    # Автосбор при покупке
+    _, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    now = int(time.time())
+
+    await update_balance(user['tg_id'], -lvl_cost + uncollected)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE mining_farms SET level = level + 1, last_collect = ? WHERE user_id = ?",
+            (now, owner_id)
+        )
+        await db.commit()
+
+    await callback.answer("🚀 Ваша майнинг-ферма успешно улучшена!", show_alert=True)
+
+    # Обновляем UI
+    farm = await get_or_create_farm(owner_id)
+    income_per_hour, new_uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    new_lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+
+    text = (
+        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
+        f"👤 Владелец: @{user['username']}\n"
+        f"⚡ Уровень системы: **{farm['level']}**\n"
+        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
+        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
+        f"🔋 **Незабранный майнинг:** `{new_uncollected:,.2f}` GHRAM\n"
+        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
+        f"⬆️ Улучшение фермы: `{new_lvl_cost:,.0f}` GHRAM"
+    )
+    kb = build_mining_keyboard(owner_id, gpu_cost, new_lvl_cost)
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+
+@dp.callback_query(F.data.startswith("farm_refresh:"))
+async def callback_farm_refresh(callback: types.CallbackQuery):
+    owner_id = int(callback.data.split(":")[1])
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша ферма!", show_alert=True)
+        return
+
+    user = await get_or_create_user(owner_id, callback.from_user.username)
+    farm = await get_or_create_farm(owner_id)
+
+    income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
+    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+
+    text = (
+        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
+        f"👤 Владелец: @{user['username']}\n"
+        f"⚡ Уровень системы: **{farm['level']}**\n"
+        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
+        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
+        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
+        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
+        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+    )
+    kb = build_mining_keyboard(owner_id, gpu_cost, lvl_cost)
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await callback.answer("Обновлено")
+
+# ----------------------------------------------------
+# 11. НОВАЯ ФУНКЦИЯ 3: ИГРА КРАШ С РАСТУЩИМ КОЭФФИЦИЕНТОМ 🚀📈
+# ----------------------------------------------------
+@dp.message(F.text.lower().startswith(("краш", "/crash")))
+async def game_crash(message: types.Message):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        await message.reply("🚀 **Игра Краш**\nИспользование: `краш [ставка]` или `краш [ставка] [автовывод]`\nПример: `краш 1000` или `краш 1000 2.5`", parse_mode="Markdown")
+        return
+
+    bet = parse_amount(parts[1], user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств или неверная сумма!")
+        return
+
+    auto_cashout = None
+    if len(parts) >= 3:
+        try:
+            val = float(parts[2].replace(",", "."))
+            if val > 1.01:
+                auto_cashout = round(val, 2)
+        except ValueError:
+            pass
+
+    game_key = (message.chat.id, message.from_user.id)
+    if game_key in active_crash_games:
+        await message.reply("❌ У вас уже есть запущенная игра в Краш!")
+        return
+
+    await update_balance(user['tg_id'], -bet)
+
+    # Генерация случайной точки падения (Exponential crash curve)
+    sys_rand = secrets.SystemRandom()
+    r = sys_rand.uniform(0.01, 0.99)
+    crash_point = round(max(1.01, 0.98 / (1.0 - r)), 2)
+    if crash_point > 100.0:
+        crash_point = 100.0
+
+    crash_id = secrets.token_hex(4)
+
+    active_crash_games[game_key] = {
+        "crash_id": crash_id,
+        "user_id": user['tg_id'],
+        "username": user['username'] or "Игрок",
+        "bet": bet,
+        "crash_point": crash_point,
+        "current_multiplier": 1.00,
+        "status": "flying",  # flying, cashed_out, crashed
+        "auto_cashout": auto_cashout
+    }
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="💰 ЗАБРАТЬ (1.00x)", callback_data=f"crash_out:{crash_id}:{user['tg_id']}")
+    ]])
+
+    display_name = f"@{user['username']}" if user['username'] and user['username'] != "Неизвестно" else "Игрок"
+    msg = await message.reply(
+        f"🚀 **Ракета вылетает!**\n\n"
+        f"👤 Игрок: {display_name}\n"
+        f"💰 Ставка: `{bet:,.2f}` GHRAM\n"
+        f"📈 Коэффициент: **1.00x**\n"
+        f"💵 Текущий выигрыш: `{bet:,.2f}` GHRAM",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+    # Фоновый таск полета ракеты
+    asyncio.create_task(run_crash_flight(message.chat.id, user['tg_id'], crash_id, msg))
+
+async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types.Message):
+    game_key = (chat_id, user_id)
+    
+    current_mult = 1.00
+    step_delay = 1.1
+
+    while True:
+        await asyncio.sleep(step_delay)
+        
+        game = active_crash_games.get(game_key)
+        if not game or game['crash_id'] != crash_id:
+            break
+
+        if game['status'] != "flying":
+            break
+
+        # Растущий коэффициент
+        increment = round(random.uniform(0.05, 0.15) if current_mult < 2.0 else random.uniform(0.15, 0.40), 2)
+        current_mult = round(current_mult + increment, 2)
+        game['current_multiplier'] = current_mult
+
+        # Проверка Автовывода
+        if game['auto_cashout'] and current_mult >= game['auto_cashout'] and current_mult < game['crash_point']:
+            win = round(game['bet'] * game['auto_cashout'], 2)
+            game['status'] = "cashed_out"
+            await update_balance(user_id, win)
+            await add_history(user_id, f"Краш (Автовывод {game['auto_cashout']}x)", win - game['bet'])
+
+            display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
+            text = (
+                f"✅ **АВТОВЫВОД СРАБОТАЛ!**\n\n"
+                f"👤 Игрок: {display_name}\n"
+                f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
+                f"🎯 Коэффициент: **{game['auto_cashout']:.2f}x**\n"
+                f"🎉 Выигрыш: **{win:,.2f}** GHRAM"
+            )
+            try:
+                await msg.edit_text(text, parse_mode="Markdown")
+            except Exception:
+                pass
+            del active_crash_games[game_key]
+            break
+
+        # Проверка КРАША
+        if current_mult >= game['crash_point']:
+            game['status'] = "crashed"
+            await add_history(user_id, "Краш (Взрыв)", -game['bet'])
+
+            display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
+            text = (
+                f"💥 **РАКЕТА ВЗОРВАЛАСЬ НА {game['crash_point']:.2f}x!**\n\n"
+                f"👤 Игрок: {display_name}\n"
+                f"💰 Потеряно: `{game['bet']:,.2f}` GHRAM"
+            )
+            try:
+                await msg.edit_text(text, parse_mode="Markdown")
+            except Exception:
+                pass
+            del active_crash_games[game_key]
+            break
+
+        # Обновление состояния полета
+        curr_win = round(game['bet'] * current_mult, 2)
+        display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=f"💰 ЗАБРАТЬ ({current_mult:.2f}x)", callback_data=f"crash_out:{crash_id}:{user_id}")
+        ]])
+
+        text = (
+            f"🚀 **Ракета летит...**\n\n"
+            f"👤 Игрок: {display_name}\n"
+            f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
+            f"📈 Коэффициент: **{current_mult:.2f}x**\n"
+            f"💵 Текущий выигрыш: `{curr_win:,.2f}` GHRAM"
+        )
+        try:
+            await msg.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+
+@dp.callback_query(F.data.startswith("crash_out:"))
+async def callback_crash_out(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    crash_id = parts[1]
+    owner_id = int(parts[2])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = (callback.message.chat.id, owner_id)
+    game = active_crash_games.get(game_key)
+
+    if not game or game['crash_id'] != crash_id:
+        await callback.answer("Эта игра уже завершена!", show_alert=True)
+        return
+
+    if game['status'] != "flying":
+        await callback.answer("Игра уже завершена!", show_alert=True)
+        return
+
+    mult = game['current_multiplier']
+    win = round(game['bet'] * mult, 2)
+    game['status'] = "cashed_out"
+
+    await update_balance(owner_id, win)
+    await add_history(owner_id, f"Краш (Выигрыш {mult:.2f}x)", win - game['bet'])
+
+    display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
+    text = (
+        f"🎉 **ВЫ УСПЕШНО ЗАБРАЛИ ВЫИГРЫШ!**\n\n"
+        f"👤 Игрок: {display_name}\n"
+        f"💰 Ставка: `{game['bet']:,.2f}` GHRAM\n"
+        f"📈 Зафиксировано: **{mult:.2f}x**\n"
+        f"🏆 Итоговый выигрыш: **{win:,.2f}** GHRAM"
+    )
+
+    del active_crash_games[game_key]
+
+    try:
+        await callback.message.edit_text(text, parse_mode="Markdown")
+    except Exception:
+        pass
+    await callback.answer(f"🎉 Вы забрали {win:,.2f} GHRAM!")
+
+# ----------------------------------------------------
+# 12. ЗАПУСК
 # ----------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
