@@ -21,7 +21,7 @@ from aiogram.exceptions import TelegramBadRequest
 # 1. КОНФИГУРАЦИЯ И ВЛАДЕЛЕЦ
 # ----------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOK", "ТВОЙ_ТОКЕН_ПО_УМОЛЧАНИЮ_ЕСЛИ_НЕТ_ENV")
-OWNER_ID = 5480751648  # ID владельца с бесконечным балансом
+OWNER_ID = 5480751648  # ID владельца сбесконечным балансом
 ADMIN_IDS = [5480751648]  # Список Telegram ID админов, имеющих доступ к /allb и /annb
 
 DB_NAME = "bot.db"
