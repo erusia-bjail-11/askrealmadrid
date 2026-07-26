@@ -54,11 +54,10 @@ xray_users = set()
 pending_duels = {}
 active_duels = {}
 
-# Игровые состояния для Блэкджека, Крестиков-Ноликов и Костей PvP
-active_bj_games = {}
+# Активные игры крестики-нолики и блекджек
 active_ttt_games = {}
-pending_dice_pvp = {}
-active_dice_pvp = {}
+pending_ttt_games = {}
+active_bj_games = {}
 
 RED_NUMBERS = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
 BLACK_NUMBERS = {2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35}
@@ -147,8 +146,7 @@ async def init_db():
             hourly_income REAL DEFAULT 150.0,
             last_claim INTEGER DEFAULT 0,
             last_bonus INTEGER DEFAULT 0,
-            language TEXT DEFAULT 'ru',
-            clan_id INTEGER DEFAULT 0
+            language TEXT DEFAULT 'ru'
         )
     """)
     
@@ -158,8 +156,7 @@ async def init_db():
         ("hourly_income", "REAL DEFAULT 150.0"),
         ("last_claim", "INTEGER DEFAULT 0"),
         ("last_bonus", "INTEGER DEFAULT 0"),
-        ("language", "TEXT DEFAULT 'ru'"),
-        ("clan_id", "INTEGER DEFAULT 0")
+        ("language", "TEXT DEFAULT 'ru'")
     ]
     for col_name, col_type in user_columns:
         try:
@@ -192,34 +189,34 @@ async def init_db():
             level INTEGER DEFAULT 1,
             gpu_count INTEGER DEFAULT 1,
             last_collect INTEGER DEFAULT 0,
-            durability INTEGER DEFAULT 100
+            collections_count INTEGER DEFAULT 0,
+            is_broken INTEGER DEFAULT 0
         )
     """)
-
-    farm_columns = [
-        ("durability", "INTEGER DEFAULT 100")
-    ]
-    for col_name, col_type in farm_columns:
-        try:
-            await bot_db.execute(f"ALTER TABLE mining_farms ADD COLUMN {col_name} {col_type}")
-        except Exception:
-            pass
+    
+    # Миграция для ферм
+    try:
+        await bot_db.execute("ALTER TABLE mining_farms ADD COLUMN collections_count INTEGER DEFAULT 0")
+        await bot_db.execute("ALTER TABLE mining_farms ADD COLUMN is_broken INTEGER DEFAULT 0")
+    except Exception:
+        pass
 
     await bot_db.execute("""
         CREATE TABLE IF NOT EXISTS clans (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL UNIQUE,
             owner_id INTEGER NOT NULL,
             balance REAL DEFAULT 0.0,
-            created_at INTEGER DEFAULT 0
+            created_at INTEGER
         )
     """)
-
+    
     await bot_db.execute("""
-        CREATE TABLE IF NOT EXISTS clan_invites (
+        CREATE TABLE IF NOT EXISTS clan_members (
             clan_id INTEGER,
-            user_id INTEGER,
-            PRIMARY KEY(clan_id, user_id)
+            user_id INTEGER PRIMARY KEY,
+            role TEXT DEFAULT 'member',
+            joined_at INTEGER
         )
     """)
 
@@ -241,10 +238,10 @@ async def init_db():
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id, id DESC)")
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_loans_user ON loans(user_id)")
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_farms_user ON mining_farms(user_id)")
-    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_clans_balance ON clans(balance DESC)")
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_type_key ON active_games(game_type, game_key)")
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_user ON active_games(user_id)")
     await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_active_games_created ON active_games(created_at)")
+    await bot_db.execute("CREATE INDEX IF NOT EXISTS idx_clan_members_clan ON clan_members(clan_id)")
 
     await bot_db.commit()
 
@@ -252,7 +249,6 @@ async def get_or_create_user(tg_id: int, username: str | None = None):
     now = int(time.time())
     initial_balance = 10**18 if tg_id == OWNER_ID else 1000.0
     
-    # INSERT OR IGNORE защищает от гонки состояний при одновременной регистрации
     await bot_db.execute(
         "INSERT OR IGNORE INTO users (tg_id, username, balance, last_claim, last_bonus, language) VALUES (?, ?, ?, ?, 0, 'ru')",
         (tg_id, username or "Неизвестно", initial_balance, now)
@@ -295,8 +291,6 @@ async def add_history(user_id: int, action: str, amount: float):
         (user_id, action, amount)
     )
     await bot_db.commit()
-
-# --- ФУНКЦИИ ДЛЯ РАБОТЫ С АКТИВНЫМИ ИГРАМИ В БД ---
 
 async def _save_game(game_type: str, game_key: str, chat_id: int, user_id: int, bet: float):
     try:
@@ -378,10 +372,6 @@ async def cleanup_stale_games():
                 d = active_duels.pop(game_key_str, None)
                 if d:
                     d['timer_task'].cancel()
-            elif game_type == "blackjack":
-                active_bj_games.pop((chat_id, user_id), None)
-            elif game_type == "ttt":
-                active_ttt_games.pop(game_key_str, None)
         
         if rows:
             await bot_db.execute("DELETE FROM active_games WHERE created_at < ?", (stale_time,))
@@ -478,18 +468,17 @@ def build_joker_keyboard(user_id: int, cards: list | None = None, game_over: boo
         keyboard = [line, [InlineKeyboardButton(text=bottom_symbol, callback_data=f"joker_dis:{user_id}")]]
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-def build_mining_keyboard(user_id: int, gpu_cost: float, lvl_cost: float, durability: int = 100):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Собрать прибыль", callback_data=f"farm_claim:{user_id}")],
-        [
-            InlineKeyboardButton(text=f"🛒 +1 GPU ({gpu_cost:,.0f})", callback_data=f"farm_buy_gpu:{user_id}"),
-            InlineKeyboardButton(text=f"⬆️ Уровень ({lvl_cost:,.0f})", callback_data=f"farm_upgrade_lvl:{user_id}")
-        ],
-        [
-            InlineKeyboardButton(text=f"🛠 Ремонт ({durability}%)", callback_data=f"farm_repair:{user_id}"),
-            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"farm_refresh:{user_id}")
-        ]
+def build_mining_keyboard(user_id: int, gpu_cost: float, lvl_cost: float, is_broken: bool, repair_cost: float):
+    kb = []
+    kb.append([InlineKeyboardButton(text="⚡ Собрать прибыль", callback_data=f"farm_claim:{user_id}")])
+    if is_broken:
+        kb.append([InlineKeyboardButton(text=f"🛠 Отремонтировать ({repair_cost:,.0f})", callback_data=f"farm_repair:{user_id}")])
+    kb.append([
+        InlineKeyboardButton(text=f"🛒 +1 GPU ({gpu_cost:,.0f})", callback_data=f"farm_buy_gpu:{user_id}"),
+        InlineKeyboardButton(text=f"⬆️ Уровень ({lvl_cost:,.0f})", callback_data=f"farm_upgrade_lvl:{user_id}")
     ])
+    kb.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=f"farm_refresh:{user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def build_loan_keyboard(user_id: int, has_loan: bool):
     if has_loan:
@@ -500,38 +489,6 @@ def build_loan_keyboard(user_id: int, has_loan: bool):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 Взять быстрый займ (50,000)", callback_data=f"loan_take_fast:{user_id}")]
     ])
-
-def build_coinflip_keyboard(user_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🦅 Орёл", callback_data=f"coin_choice:heads:{user_id}"),
-            InlineKeyboardButton(text="🪙 Решка", callback_data=f"coin_choice:tails:{user_id}")
-        ],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"coin_choice:cancel:{user_id}")]
-    ])
-
-def build_bj_keyboard(user_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="➕ Взять карту", callback_data=f"bj_act:hit:{user_id}"),
-            InlineKeyboardButton(text="🛑 Хватит", callback_data=f"bj_act:stand:{user_id}")
-        ],
-        [InlineKeyboardButton(text="🚪 Сдаться (-50%)", callback_data=f"bj_act:fold:{user_id}")]
-    ])
-
-def build_ttt_keyboard(game_id: str, board: list, active: bool = True):
-    keyboard = []
-    symbols = {0: "➖", 1: "❌", 2: "⭕"}
-    for row in range(3):
-        line = []
-        for col in range(3):
-            idx = row * 3 + col
-            val = board[idx]
-            text = symbols.get(val, "➖")
-            cb = f"ttt_move:{game_id}:{idx}" if active and val == 0 else "ttt_dis"
-            line.append(InlineKeyboardButton(text=text, callback_data=cb))
-        keyboard.append(line)
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 # ----------------------------------------------------
 # 5. АДМИН-КОМАНДЫ
@@ -591,16 +548,16 @@ async def cmd_annf(message: types.Message):
         if not target_user:
             await message.reply("❌ Пользователь не найден!")
             return
-
+        
         await bot_db.execute("DELETE FROM mining_farms WHERE user_id = ?", (target_user['tg_id'],))
         await bot_db.commit()
-
-        await message.reply(f"🔥 Майнинг-ферма пользователя @{target_user['username']} (ID: {target_user['tg_id']}) полностью аннулирована!")
+            
+        await message.reply(f"🔥 Ферма пользователя @{target_user['username']} (ID: {target_user['tg_id']}) аннулирована!")
     else:
         await bot_db.execute("DELETE FROM mining_farms")
         await bot_db.commit()
-
-        await message.reply("🔥 Майнинг-фермы **всех пользователей** были успешно аннулированы!", parse_mode="Markdown")
+            
+        await message.reply("🔥 Фермы **всех игроков** были успешно аннулированы!", parse_mode="Markdown")
 
 @dp.message(Command("secm"))
 async def cmd_secm(message: types.Message):
@@ -671,21 +628,6 @@ async def cmd_gamb(message: types.Message):
             cancelled_games += 1
             await _remove_game("joker", f"{key[0]}:{key[1]}")
 
-    for key in list(active_crash_games.keys()):
-        if key[1] == target_id:
-            game = active_crash_games.pop(key)
-            game['status'] = 'cancelled'
-            refund_amount += game['bet']
-            cancelled_games += 1
-            await _remove_game("crash", f"{key[0]}:{key[1]}")
-
-    for key in list(active_roulette_bets.keys()):
-        if key[1] == target_id:
-            bets = active_roulette_bets.pop(key)
-            refund_amount += sum(b['bet'] for b in bets)
-            cancelled_games += 1
-            await _remove_game("roulette", f"{key[0]}:{key[1]}")
-
     if refund_amount > 0:
         await update_balance(target_id, refund_amount)
 
@@ -697,10 +639,6 @@ async def cmd_gamb(message: types.Message):
             await update_balance(d['challenger_id'], d['bet'])
             cancelled_games += 1
             await _remove_game("duel_pending", d_id)
-            try:
-                await d['msg'].edit_text("🚫 Дуэль отменена администратором.")
-            except Exception:
-                pass
 
     for d_id in list(active_duels.keys()):
         d = active_duels.get(d_id)
@@ -711,10 +649,6 @@ async def cmd_gamb(message: types.Message):
             await update_balance(d['p2_id'], d['bet'])
             cancelled_games += 1
             await _remove_game("duel_active", d_id)
-            try:
-                await d['msg'].edit_text("🚫 Дуэль принудительно остановлена администратором. Ставки возвращены.")
-            except Exception:
-                pass
 
     if cancelled_games == 0:
         await message.reply(f"ℹ️ У пользователя @{target_user['username']} нет активных игр.")
@@ -818,7 +752,6 @@ async def callback_set_language(callback: types.CallbackQuery):
             reply_markup=kb
         )
 
-# --- БОНУС ---
 async def process_bonus_claim(user_id: int, username: str | None) -> str:
     user = await get_or_create_user(user_id, username)
     now = int(time.time())
@@ -851,7 +784,6 @@ async def callback_bonus(callback: types.CallbackQuery):
     response_text = await process_bonus_claim(callback.from_user.id, callback.from_user.username)
     await callback.answer(response_text, show_alert=True)
 
-# --- БАЛАНС ---
 @dp.message(F.text.lower().in_(["б", "баланс", "/balance", "/баланс", "balance"]))
 async def show_balance(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -862,7 +794,6 @@ async def show_balance(message: types.Message):
         reply_markup=balance_inline_keyboard()
     )
 
-# --- ПРОФИЛЬ ---
 @dp.message(F.text.lower().in_(["/профиль", "профиль", "👤 профиль", "profile", "👤 profile"]))
 async def show_profile(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -870,18 +801,10 @@ async def show_profile(message: types.Message):
     bal_str = get_balance_str(user['tg_id'], user['balance'])
     bank_str = get_balance_str(user['tg_id'], user['bank'])
     
-    clan_name = "Нет"
-    if user['clan_id'] and user['clan_id'] > 0:
-        async with bot_db.execute("SELECT name FROM clans WHERE id = ?", (user['clan_id'],)) as cursor:
-            clan_row = await cursor.fetchone()
-            if clan_row:
-                clan_name = clan_row['name']
-
     if lang == "en":
         text = (
             f"👤 **User Profile:** @{user['username']}\n"
             f"🆔 ID: `{user['tg_id']}`\n"
-            f"⚔️ Clan: `{clan_name}`\n"
             f"💰 Balance: `{bal_str}` coins\n"
             f"🏦 In Bank: `{bank_str}` coins\n"
             f"📈 Passive Income: `{user['hourly_income']:,.2f}`/hour"
@@ -890,14 +813,12 @@ async def show_profile(message: types.Message):
         text = (
             f"👤 **Профиль пользователя:** @{user['username']}\n"
             f"🆔 ID: `{user['tg_id']}`\n"
-            f"⚔️ Клан: `{clan_name}`\n"
             f"💰 Баланс: `{bal_str}` монет\n"
             f"🏦 В банке: `{bank_str}` монет\n"
             f"📈 Пассивный доход: `{user['hourly_income']:,.2f}`/час"
         )
     await message.reply(text, parse_mode="Markdown")
 
-# --- ИСТОРИЯ ---
 @dp.message(F.text.lower().in_(["/история", "история", "history"]))
 async def show_history(message: types.Message):
     async with bot_db.execute(
@@ -916,7 +837,6 @@ async def show_history(message: types.Message):
         text += f"• {r['action']}: `{sign}{r['amount']:,.2f}` монет ({r['created_at']})\n"
     await message.reply(text, parse_mode="Markdown")
 
-# --- ЕДИНЫЙ ТОП ---
 @dp.message(F.text.lower().startswith(("/top", "топ", "/топ")))
 async def show_top(message: types.Message):
     parts = message.text.split()
@@ -938,7 +858,6 @@ async def show_top(message: types.Message):
 
     await message.reply(text, parse_mode="Markdown")
 
-# --- ПЕРЕВОД (С НАЛОГОМ НА ПЕРЕВОДЫ P2P TAX) ---
 @dp.message(F.text.lower().startswith("п "))
 async def transfer_money(message: types.Message):
     sender = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -985,33 +904,26 @@ async def transfer_money(message: types.Message):
         await message.reply("❌ Нельзя переводить монеты самому себе!")
         return
 
-    # Прогрессивный налог на переводы (P2P Tax: 5%, 10%, или 15% от 500k)
-    if amount < 100_000:
-        tax_rate = 0.05
-    elif amount < 500_000:
-        tax_rate = 0.10
-    else:
-        tax_rate = 0.15
-
-    tax_amount = amount * tax_rate
-    final_amount = amount - tax_amount
+    # P2P Tax Logic (добавлено согласно задаче)
+    tax_percent = 15 if amount >= 500000 else 10
+    tax = amount * (tax_percent / 100.0)
+    net_amount = amount - tax
 
     await update_balance(sender['tg_id'], -amount)
-    await update_balance(target_user['tg_id'], final_amount)
+    await update_balance(target_user['tg_id'], net_amount)
 
     target_name = f"@{target_user['username']}" if target_user['username'] != "Неизвестно" else f"ID {target_user['tg_id']}"
 
-    await add_history(sender['tg_id'], f"Перевод для {target_name}", -amount)
-    await add_history(target_user['tg_id'], f"Перевод от @{sender['username']}", final_amount)
+    await add_history(sender['tg_id'], f"Перевод для {target_name} (Комиссия {tax_percent}%)", -amount)
+    await add_history(target_user['tg_id'], f"Перевод от @{sender['username']}", net_amount)
 
     await message.reply(
         f"✅ Вы успешно перевели `{amount:,.2f}` монет пользователю **{target_name}**!\n"
-        f"🏛 Налог на перевод ({int(tax_rate * 100)}%): `{tax_amount:,.2f}` GHRAM\n"
-        f"📥 Получателю зачислено: `{final_amount:,.2f}` GHRAM", 
+        f"💸 Налог на перевод ({tax_percent}%): `- {tax:,.2f}`\n"
+        f"📥 Получателю доставлено: `{net_amount:,.2f}` монет.", 
         parse_mode="Markdown"
     )
 
-# --- КОМАНДА /стоп ДЛЯ ОТМЕНЫ ВСЕХ ИГР ---
 @dp.message(F.text.lower().in_(["/stop", "/стоп", "стоп", "stop", "прекратить", "/cancel", "/отмена"]))
 async def cmd_stop_all_games(message: types.Message):
     user_id = message.from_user.id
@@ -1029,20 +941,6 @@ async def cmd_stop_all_games(message: types.Message):
         refunds.append((user_id, game['bet']))
         await _remove_game("joker", f"{chat_id}:{user_id}")
 
-    if key in active_crash_games:
-        game = active_crash_games.pop(key)
-        if game.get('status') == 'flying':
-            game['status'] = 'cancelled'
-        refunds.append((user_id, game['bet']))
-        await _remove_game("crash", f"{chat_id}:{user_id}")
-
-    if key in active_roulette_bets and active_roulette_bets[key]:
-        bets = active_roulette_bets[key]
-        total = sum(b['bet'] for b in bets)
-        refunds.append((user_id, total))
-        active_roulette_bets[key] = []
-        await _remove_game("roulette", f"{chat_id}:{user_id}")
-
     if key in active_bj_games:
         game = active_bj_games.pop(key)
         refunds.append((user_id, game['bet']))
@@ -1055,10 +953,6 @@ async def cmd_stop_all_games(message: types.Message):
             pending_duels.pop(d_id)
             refunds.append((user_id, d['bet']))
             await _remove_game("duel_pending", d_id)
-            try:
-                await d['msg'].edit_text("🚫 Дуэль отменена. Ставка возвращена.")
-            except Exception:
-                pass
             break
 
     for d_id in list(active_duels.keys()):
@@ -1069,10 +963,6 @@ async def cmd_stop_all_games(message: types.Message):
             refunds.append((d['p1_id'], d['bet']))
             refunds.append((d['p2_id'], d['bet']))
             await _remove_game("duel_active", d_id)
-            try:
-                await d['msg'].edit_text("🚫 Дуэль отменена. Ставки возвращены обоим игрокам.")
-            except Exception:
-                pass
             break
 
     if refunds:
@@ -1080,16 +970,15 @@ async def cmd_stop_all_games(message: types.Message):
             await update_balance(uid, amt)
         own_refund = sum(amt for uid, amt in refunds if uid == user_id)
         if own_refund > 0:
-            await message.reply(
-                f"✅ Все ваши активные игры отменены.\n💰 Возвращено: `{own_refund:,.2f}` GHRAM.",
-                parse_mode="Markdown"
-            )
+            await message.reply(f"✅ Все ваши активные игры отменены.\n💰 Возвращено: `{own_refund:,.2f}` GHRAM.", parse_mode="Markdown")
         else:
-            await message.reply("✅ Активная игра/дуэль отменена. Ставки возвращены.")
+            await message.reply("✅ Активная дуэль отменена. Ставки возвращены.")
     else:
         await message.reply("ℹ️ У вас нет активных игр для отмены.")
 
-# --- ИНТЕРАКТИВНАЯ ДУЭЛЬ ---
+# ----------------------------------------------------
+# 7. МИНИ-ИГРЫ И ДУЭЛИ
+# ----------------------------------------------------
 @dp.message(F.text.lower().startswith(("/дуэль", "дуэль")))
 async def make_duel(message: types.Message):
     sender = await get_or_create_user(message.from_user.id, message.from_user.username)
@@ -1304,7 +1193,8 @@ async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
     next_name = duel["p2_name"] if shooter_id == duel["p1_id"] else duel["p1_name"]
 
     if is_hit:
-        total_win = duel["bet"] * 2
+        # Учитываем House Edge (1.95x выплата от изначальной ставки вместо 2x)
+        total_win = duel["bet"] * 1.95
         await update_balance(shooter_id, total_win)
 
         await add_history(shooter_id, "Победа в дуэли", total_win - duel["bet"])
@@ -1384,10 +1274,6 @@ async def msg_duel_shot(message: types.Message):
         return
 
     await process_duel_shot(found_duel_id, message.from_user.id, message)
-
-# ----------------------------------------------------
-# 7. МИНИ-ИГРЫ
-# ----------------------------------------------------
 
 # --- МИНЫ ---
 @dp.message(F.text.lower().startswith("мины"))
@@ -1669,611 +1555,6 @@ async def callback_joker_disabled(callback: types.CallbackQuery):
     await callback.answer("Эта игра уже завершена!")
 
 
-# --- 🎲 КОСТИ (PvE И PvP С HOUSE EDGE) ---
-@dp.message(F.text.lower().startswith(("кости", "/dice")))
-async def game_dice(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        await message.reply("🎲 Введите: `кости [сумма]` для игры с ботом или `кости [@username] [сумма]` для PvP дуэли!")
-        return
-
-    # Проверяем, указан ли игрок для PvP
-    target_user = None
-    bet = None
-
-    if message.reply_to_message:
-        bet = parse_amount(parts[1], user['balance'])
-        target_id = message.reply_to_message.from_user.id
-        target_user = await get_or_create_user(target_id, message.reply_to_message.from_user.username)
-    elif len(parts) >= 3:
-        target_user = await get_user_by_identifier(parts[1])
-        if target_user:
-            bet = parse_amount(parts[2], user['balance'])
-    
-    if not target_user and not bet:
-        bet = parse_amount(parts[1], user['balance'])
-
-    if not bet or bet <= 0:
-        await message.reply("❌ Неверно указана сумма ставки!")
-        return
-
-    if not check_balance(user['tg_id'], user['balance'], bet):
-        await message.reply("❌ Недостаточно средств!")
-        return
-
-    # Если PvP режим
-    if target_user:
-        if target_user['tg_id'] == user['tg_id']:
-            await message.reply("❌ Нельзя играть в кости с самим собой!")
-            return
-        if not check_balance(target_user['tg_id'], target_user['balance'], bet):
-            await message.reply("❌ У соперника недостаточно монет!")
-            return
-
-        await update_balance(user['tg_id'], -bet)
-        game_id = secrets.token_hex(4)
-
-        pending_dice_pvp[game_id] = {
-            "chat_id": message.chat.id,
-            "p1_id": user['tg_id'],
-            "p1_name": f"@{user['username']}" if user['username'] else "Игрок 1",
-            "p2_id": target_user['tg_id'],
-            "p2_name": f"@{target_user['username']}" if target_user['username'] else "Игрок 2",
-            "bet": bet
-        }
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Бросить кости 🎲", callback_data=f"dice_acc:{game_id}"),
-            InlineKeyboardButton(text="Отклонить ⛔", callback_data=f"dice_dec:{game_id}")
-        ]])
-
-        target_mention = f"@{target_user['username']}" if target_user['username'] else f"ID {target_user['tg_id']}"
-        await message.reply(
-            f"🎲 **PvP Кости!**\n"
-            f"{target_mention}, вам бросили вызов в кости!\n"
-            f"💰 Ставка: **{bet:,.2f}** GHRAM",
-            reply_markup=kb,
-            parse_mode="Markdown"
-        )
-        return
-
-    # PvE Режим против Бота (House edge 1.95x payout)
-    await update_balance(user['tg_id'], -bet)
-
-    p_roll1, p_roll2 = random.randint(1, 6), random.randint(1, 6)
-    b_roll1, b_roll2 = random.randint(1, 6), random.randint(1, 6)
-
-    # Легкое смещение вероятности в сторону бота (House Edge)
-    if random.random() < 0.05:
-        b_roll1 = min(6, b_roll1 + 1)
-
-    p_total = p_roll1 + p_roll2
-    b_total = b_roll1 + b_roll2
-
-    display_name = f"@{user['username']}" if user['username'] else "Игрок"
-
-    if p_total > b_total:
-        win = bet * 1.95  # House Edge выплата
-        await update_balance(user['tg_id'], win)
-        await add_history(user['tg_id'], "Кости PvE (Победа)", win - bet)
-        res = f"🎉 **Победа! Вы выиграли `{win:,.2f}` GHRAM!**"
-    elif p_total < b_total:
-        await add_history(user['tg_id'], "Кости PvE (Поражение)", -bet)
-        res = f"💥 **Поражение! Бот забрал ставку.**"
-    else:
-        await update_balance(user['tg_id'], bet)
-        res = f"🤝 **Ничья! Ставка `{bet:,.2f}` GHRAM возвращена.**"
-
-    text = (
-        f"🎲 **Игра в Кости (PvE)**\n\n"
-        f"👤 {display_name}: 🎲 [{p_roll1}] + [{p_roll2}] = **{p_total}**\n"
-        f"🤖 Бот: 🎲 [{b_roll1}] + [{b_roll2}] = **{b_total}**\n\n"
-        f"{res}"
-    )
-    await message.reply(text, parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("dice_acc:"))
-async def cb_dice_pvp_accept(callback: types.CallbackQuery):
-    game_id = callback.data.split(":")[1]
-    game = pending_dice_pvp.pop(game_id, None)
-
-    if not game:
-        await callback.answer("Эта игра в кости больше неактивна!", show_alert=True)
-        return
-
-    if callback.from_user.id != game["p2_id"]:
-        await callback.answer("❌ Принять вызов может только приглашенный игрок!", show_alert=True)
-        return
-
-    p2_user = await get_or_create_user(game["p2_id"], callback.from_user.username)
-    if not check_balance(p2_user['tg_id'], p2_user['balance'], game['bet']):
-        await update_balance(game["p1_id"], game["bet"])
-        await callback.answer("❌ Недостаточно средств для участия!", show_alert=True)
-        return
-
-    await update_balance(game["p2_id"], -game['bet'])
-
-    p1_r1, p1_r2 = random.randint(1, 6), random.randint(1, 6)
-    p2_r1, p2_r2 = random.randint(1, 6), random.randint(1, 6)
-
-    p1_tot = p1_r1 + p1_r2
-    p2_tot = p2_r1 + p2_r2
-
-    bet = game["bet"]
-    total_bank = bet * 2
-
-    if p1_tot > p2_tot:
-        await update_balance(game["p1_id"], total_bank)
-        res = f"👑 Победитель: {game['p1_name']} (+{total_bank:,.2f} GHRAM)!"
-    elif p2_tot > p1_tot:
-        await update_balance(game["p2_id"], total_bank)
-        res = f"👑 Победитель: {game['p2_name']} (+{total_bank:,.2f} GHRAM)!"
-    else:
-        await update_balance(game["p1_id"], bet)
-        await update_balance(game["p2_id"], bet)
-        res = f"🤝 Ничья! Ставки возвращены всем игрокам."
-
-    text = (
-        f"🎲 **PvP Дуэль в Кости Завершена!**\n\n"
-        f"👤 {game['p1_name']}: 🎲 [{p1_r1}] + [{p1_r2}] = **{p1_tot}**\n"
-        f"👤 {game['p2_name']}: 🎲 [{p2_r1}] + [{p2_r2}] = **{p2_tot}**\n\n"
-        f"{res}"
-    )
-    await callback.message.edit_text(text, parse_mode="Markdown")
-    await callback.answer("🎲 Кости брошены!")
-
-@dp.callback_query(F.data.startswith("dice_dec:"))
-async def cb_dice_pvp_decline(callback: types.CallbackQuery):
-    game_id = callback.data.split(":")[1]
-    game = pending_dice_pvp.pop(game_id, None)
-
-    if not game:
-        await callback.answer("Игра не найдена!", show_alert=True)
-        return
-
-    if callback.from_user.id != game["p2_id"]:
-        await callback.answer("❌ Отклонить может только вызванный игрок!", show_alert=True)
-        return
-
-    await update_balance(game["p1_id"], game["bet"])
-    await callback.message.edit_text(f"⛔ {game['p2_name']} отклонил игра в кости. Ставка возвращена.")
-    await callback.answer("Вызов отклонен")
-
-
-# --- 🪙 МОНЕТКА (COINFLIP С HOUSE EDGE) ---
-@dp.message(F.text.lower().startswith(("монетка", "монета", "/coin")))
-async def game_coinflip(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        await message.reply("🪙 Введите ставку: `монетка [сумма]`")
-        return
-
-    bet = parse_amount(parts[1], user['balance'])
-    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
-        await message.reply("❌ Недостаточно средств или неверная сумма!")
-        return
-
-    display_name = f"@{user['username']}" if user['username'] else "Игрок"
-    kb = build_coinflip_keyboard(user['tg_id'])
-
-    # Сохраняем активный выбор
-    active_mines_games[(message.chat.id, user['tg_id'], "coin")] = {"bet": bet}
-
-    await message.reply(
-        f"🪙 {display_name}, сделайте выбор:\n"
-        f"💰 Ставка: **{bet:,.2f}** GHRAM\n"
-        f"📈 Выплата: **1.95x**",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-
-@dp.callback_query(F.data.startswith("coin_choice:"))
-async def cb_coin_choice(callback: types.CallbackQuery):
-    parts = callback.data.split(":")
-    choice = parts[1]
-    owner_id = int(parts[2])
-
-    if callback.from_user.id != owner_id:
-        await callback.answer("❌ Это не ваша игра!", show_alert=True)
-        return
-
-    key = (callback.message.chat.id, owner_id, "coin")
-    game_data = active_mines_games.pop(key, None)
-
-    if not game_data:
-        await callback.answer("Игра отменена или не найдена!", show_alert=True)
-        return
-
-    if choice == "cancel":
-        await callback.message.edit_text("❌ Игра в монетку отменена.")
-        await callback.answer("Отменено")
-        return
-
-    bet = game_data["bet"]
-    user = await get_or_create_user(owner_id, callback.from_user.username)
-
-    if not check_balance(owner_id, user['balance'], bet):
-        await callback.answer("❌ Недостаточно монет на балансе!", show_alert=True)
-        return
-
-    await update_balance(owner_id, -bet)
-
-    # House edge: вероятность выигрыша 48%
-    is_win = random.random() < 0.48
-    result_coin = choice if is_win else ("tails" if choice == "heads" else "heads")
-    coin_icon = "🦅 Орёл" if result_coin == "heads" else "🪙 Решка"
-
-    if is_win:
-        win_amt = bet * 1.95
-        await update_balance(owner_id, win_amt)
-        await add_history(owner_id, "Монетка (Победа)", win_amt - bet)
-        res_text = f"🎉 **ВЫ УГАДАЛИ!** Выпал: {coin_icon}\n🏆 Выиграно: `{win_amt:,.2f}` GHRAM!"
-    else:
-        await add_history(owner_id, "Монетка (Поражение)", -bet)
-        res_text = f"💥 **УВЫ!** Выпал: {coin_icon}\n💰 Потеряно: `{bet:,.2f}` GHRAM"
-
-    await callback.message.edit_text(
-        f"🪙 **Результат броска монетки:**\n\n{res_text}",
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-
-# --- 🃏 БЛЭКДЖЕК (BLACKJACK С HOUSE EDGE) ---
-def get_card_value(cards):
-    total = 0
-    aces = 0
-    for card in cards:
-        val = card[:-1]
-        if val in ["J", "Q", "K"]:
-            total += 10
-        elif val == "A":
-            aces += 1
-            total += 11
-        else:
-            total += int(val)
-    while total > 21 and aces > 0:
-        total -= 10
-        aces -= 1
-    return total
-
-@dp.message(F.text.lower().startswith(("блэкджек", "бд", "/bj")))
-async def game_blackjack(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        await message.reply("🃏 Введите ставку: `блэкджек [сумма]`")
-        return
-
-    bet = parse_amount(parts[1], user['balance'])
-    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
-        await message.reply("❌ Недостаточно средств!")
-        return
-
-    game_key = (message.chat.id, user['tg_id'])
-    if game_key in active_bj_games:
-        await message.reply("❌ У вас уже есть активная игра в Блэкджек!")
-        return
-
-    await update_balance(user['tg_id'], -bet)
-
-    suits = ["♠️", "♥️", "♦️", "♣️"]
-    ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"]
-    deck = [f"{r}{s}" for r in ranks for s in suits]
-    random.shuffle(deck)
-
-    player_hand = [deck.pop(), deck.pop()]
-    dealer_hand = [deck.pop(), deck.pop()]
-
-    active_bj_games[game_key] = {
-        "bet": bet,
-        "deck": deck,
-        "player": player_hand,
-        "dealer": dealer_hand,
-        "user_id": user['tg_id']
-    }
-
-    await _save_game("blackjack", f"{message.chat.id}:{user['tg_id']}", message.chat.id, user['tg_id'], bet)
-
-    p_score = get_card_value(player_hand)
-    
-    text = (
-        f"🃏 **Блэкджек**\n\n"
-        f"👤 Ваши карты: {' '.join(player_hand)} (**{p_score}**)\n"
-        f"🤖 Дилер: {dealer_hand[0]} 🎴 (**?**)\n\n"
-        f"💰 Ставка: `{bet:,.2f}` GHRAM"
-    )
-
-    kb = build_bj_keyboard(user['tg_id'])
-    await message.reply(text, reply_markup=kb, parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("bj_act:"))
-async def cb_bj_action(callback: types.CallbackQuery):
-    parts = callback.data.split(":")
-    action = parts[1]
-    owner_id = int(parts[2])
-
-    if callback.from_user.id != owner_id:
-        await callback.answer("❌ Это не ваша игра!", show_alert=True)
-        return
-
-    game_key = (callback.message.chat.id, owner_id)
-    game = active_bj_games.get(game_key)
-
-    if not game:
-        await callback.answer("Игра завершена!", show_alert=True)
-        return
-
-    bet = game["bet"]
-    deck = game["deck"]
-    player = game["player"]
-    dealer = game["dealer"]
-
-    if action == "fold":
-        refund = bet * 0.5
-        await update_balance(owner_id, refund)
-        del active_bj_games[game_key]
-        await _remove_game("blackjack", f"{callback.message.chat.id}:{owner_id}")
-        await callback.message.edit_text(f"🚪 Вы сдались. Возвращено 50% ставки: `{refund:,.2f}` GHRAM.", parse_mode="Markdown")
-        await callback.answer("Сдались")
-        return
-
-    if action == "hit":
-        player.append(deck.pop())
-        p_score = get_card_value(player)
-
-        if p_score > 21:
-            del active_bj_games[game_key]
-            await _remove_game("blackjack", f"{callback.message.chat.id}:{owner_id}")
-            await add_history(owner_id, "Блэкджек (Перебор)", -bet)
-            await callback.message.edit_text(
-                f"💥 **Перебор! ({p_score})**\nВаши карты: {' '.join(player)}\n💰 Потеряно: `{bet:,.2f}` GHRAM",
-                parse_mode="Markdown"
-            )
-            await callback.answer("💥 Перебор!")
-            return
-
-        text = (
-            f"🃏 **Блэкджек**\n\n"
-            f"👤 Ваши карты: {' '.join(player)} (**{p_score}**)\n"
-            f"🤖 Дилер: {dealer[0]} 🎴 (**?**)\n\n"
-            f"💰 Ставка: `{bet:,.2f}` GHRAM"
-        )
-        await callback.message.edit_text(text, reply_markup=build_bj_keyboard(owner_id), parse_mode="Markdown")
-        await callback.answer()
-        return
-
-    if action == "stand":
-        d_score = get_card_value(dealer)
-        while d_score < 17:
-            dealer.append(deck.pop())
-            d_score = get_card_value(dealer)
-
-        p_score = get_card_value(player)
-        del active_bj_games[game_key]
-        await _remove_game("blackjack", f"{callback.message.chat.id}:{owner_id}")
-
-        if d_score > 21 or p_score > d_score:
-            win = bet * 1.95  # House edge 1.95x
-            await update_balance(owner_id, win)
-            await add_history(owner_id, "Блэкджек (Победа)", win - bet)
-            res = f"🎉 **ПОБЕДА!** Вы выиграли `{win:,.2f}` GHRAM!"
-        elif p_score < d_score:
-            await add_history(owner_id, "Блэкджек (Поражение)", -bet)
-            res = f"💥 **ПОРАЖЕНИЕ!** Дилер забирает банк."
-        else:
-            await update_balance(owner_id, bet)
-            res = f"🤝 **НИЧЬЯ!** Ставка `{bet:,.2f}` GHRAM возвращена."
-
-        text = (
-            f"🃏 **Итог Игры в Блэкджек**\n\n"
-            f"👤 Ваши карты: {' '.join(player)} (**{p_score}**)\n"
-            f"🤖 Дилер: {' '.join(dealer)} (**{d_score}**)\n\n"
-            f"{res}"
-        )
-        await callback.message.edit_text(text, parse_mode="Markdown")
-        await callback.answer()
-
-
-# --- ❌⭕ КРЕСТИКИ-НОЛИКИ (PvE / PvP) ---
-@dp.message(F.text.lower().startswith(("крестики", "/ttt")))
-async def game_ttt(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        await message.reply("❌ Введите: `крестики [сумма]` для игры с ботом!")
-        return
-
-    bet = parse_amount(parts[1], user['balance'])
-    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
-        await message.reply("❌ Недостаточно средств!")
-        return
-
-    await update_balance(user['tg_id'], -bet)
-
-    game_id = secrets.token_hex(4)
-    board = [0] * 9
-
-    active_ttt_games[game_id] = {
-        "chat_id": message.chat.id,
-        "p1_id": user['tg_id'],
-        "p1_name": f"@{user['username']}" if user['username'] else "Игрок",
-        "bet": bet,
-        "board": board,
-        "turn": user['tg_id']
-    }
-
-    kb = build_ttt_keyboard(game_id, board, True)
-    await message.reply(
-        f"❌⭕ **Крестики-Нолики (PvE)**\n"
-        f"💰 Ставка: `{bet:,.2f}` GHRAM\n"
-        f"Ваш ход! (Вы играете за ❌)",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
-
-def check_ttt_winner(board):
-    lines = [
-        [0, 1, 2], [3, 4, 5], [6, 7, 8],
-        [0, 3, 6], [1, 4, 7], [2, 5, 8],
-        [0, 4, 8], [2, 4, 6]
-    ]
-    for a, b, c in lines:
-        if board[a] != 0 and board[a] == board[b] == board[c]:
-            return board[a]
-    if 0 not in board:
-        return -1
-    return 0
-
-@dp.callback_query(F.data.startswith("ttt_move:"))
-async def cb_ttt_move(callback: types.CallbackQuery):
-    parts = callback.data.split(":")
-    game_id = parts[1]
-    cell = int(parts[2])
-
-    game = active_ttt_games.get(game_id)
-    if not game:
-        await callback.answer("Игра не найдена!", show_alert=True)
-        return
-
-    if callback.from_user.id != game["p1_id"]:
-        await callback.answer("❌ Это не ваша игра!", show_alert=True)
-        return
-
-    board = game["board"]
-    if board[cell] != 0:
-        await callback.answer("Клетка уже занята!")
-        return
-
-    board[cell] = 1  # ❌ Ход игрока
-    win_status = check_ttt_winner(board)
-
-    bet = game["bet"]
-    owner_id = game["p1_id"]
-
-    if win_status == 1:
-        win_amt = bet * 1.90  # House edge 1.9x
-        await update_balance(owner_id, win_amt)
-        await add_history(owner_id, "Крестики-Нолики (Победа)", win_amt - bet)
-        del active_ttt_games[game_id]
-        await callback.message.edit_text(
-            f"🎉 **ПОБЕДА!** Вы выиграли `{win_amt:,.2f}` GHRAM!",
-            reply_markup=build_ttt_keyboard(game_id, board, False),
-            parse_mode="Markdown"
-        )
-        return
-    elif win_status == -1:
-        await update_balance(owner_id, bet)
-        del active_ttt_games[game_id]
-        await callback.message.edit_text(
-            f"🤝 **НИЧЬЯ!** Ставка `{bet:,.2f}` GHRAM возвращена.",
-            reply_markup=build_ttt_keyboard(game_id, board, False),
-            parse_mode="Markdown"
-        )
-        return
-
-    # Ход Бота (⭕ = 2)
-    empty_cells = [i for i, v in enumerate(board) if v == 0]
-    if empty_cells:
-        bot_choice = random.choice(empty_cells)
-        board[bot_choice] = 2
-
-    win_status = check_ttt_winner(board)
-    if win_status == 2:
-        await add_history(owner_id, "Крестики-Нолики (Поражение)", -bet)
-        del active_ttt_games[game_id]
-        await callback.message.edit_text(
-            f"💥 **ПОРАЖЕНИЕ!** Бот победил.",
-            reply_markup=build_ttt_keyboard(game_id, board, False),
-            parse_mode="Markdown"
-        )
-        return
-    elif win_status == -1:
-        await update_balance(owner_id, bet)
-        del active_ttt_games[game_id]
-        await callback.message.edit_text(
-            f"🤝 **НИЧЬЯ!** Ставка `{bet:,.2f}` GHRAM возвращена.",
-            reply_markup=build_ttt_keyboard(game_id, board, False),
-            parse_mode="Markdown"
-        )
-        return
-
-    await callback.message.edit_text(
-        f"❌⭕ **Крестики-Нолики (PvE)**\n💰 Ставка: `{bet:,.2f}` GHRAM\nВаш ход!",
-        reply_markup=build_ttt_keyboard(game_id, board, True),
-        parse_mode="Markdown"
-    )
-    await callback.answer()
-
-
-# --- 🎰 СЛОТЫ (SLOTS С RTP 92%) ---
-@dp.message(F.text.lower().startswith(("слоты", "слот", "/slots", "с ")))
-async def game_slots(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split()
-
-    if len(parts) < 2:
-        await message.reply("🎰 Введите ставку: `слоты [сумма]`")
-        return
-
-    bet = parse_amount(parts[1], user['balance'])
-    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
-        await message.reply("❌ Недостаточно средств!")
-        return
-
-    await update_balance(user['tg_id'], -bet)
-
-    symbols = ["🍇", "🍒", "🍋", "💎", "7️⃣"]
-    
-    # Распределение RTP ~92%
-    roll = random.random()
-    if roll < 0.005:
-        res_symbols = ["7️⃣", "7️⃣", "7️⃣"]
-        multiplier = 10.0
-    elif roll < 0.02:
-        res_symbols = ["💎", "💎", "💎"]
-        multiplier = 5.0
-    elif roll < 0.07:
-        s = random.choice(["🍇", "🍒", "🍋"])
-        res_symbols = [s, s, s]
-        multiplier = 3.0
-    elif roll < 0.22:
-        s = random.choice(symbols)
-        other = random.choice([x for x in symbols if x != s])
-        res_symbols = [s, s, other]
-        random.shuffle(res_symbols)
-        multiplier = 1.5
-    else:
-        res_symbols = random.sample(symbols, 3)
-        multiplier = 0.0
-
-    display_name = f"@{user['username']}" if user['username'] else "Игрок"
-    slot_line = " | ".join(res_symbols)
-
-    if multiplier > 0:
-        win_amt = bet * multiplier
-        await update_balance(user['tg_id'], win_amt)
-        await add_history(user['tg_id'], "Слоты (Победа)", win_amt - bet)
-        res_msg = f"🎉 **ДЖЕКПОТ!** Вы выиграли `{win_amt:,.2f}` GHRAM! ({multiplier}x)"
-    else:
-        await add_history(user['tg_id'], "Слоты (Поражение)", -bet)
-        res_msg = f"💥 **УВЫ!** Вы ничего не выиграли."
-
-    text = (
-        f"🎰 **Игровой Автомат GHRAM Slots**\n\n"
-        f"🎰 [ {slot_line} ]\n\n"
-        f"👤 Игрок: {display_name}\n"
-        f"💰 Ставка: `{bet:,.2f}` GHRAM\n"
-        f"{res_msg}"
-    )
-    await message.reply(text, parse_mode="Markdown")
-
 # ----------------------------------------------------
 # 8. КРЕДИТЫ И ЗАЙМЫ ПОД ПРОЦЕНТ 🏦
 # ----------------------------------------------------
@@ -2478,7 +1759,7 @@ async def callback_loan_refresh(callback: types.CallbackQuery):
     await callback.answer("Обновлено")
 
 # ----------------------------------------------------
-# 9. БИЗНЕС МAЙНИНГ-ФЕРМА 💻⚡ (С ИЗНОСОМ И ОБСЛУЖИВАНИЕМ)
+# 9. БИЗНЕС МAЙНИНГ-ФЕРМА 💻⚡
 # ----------------------------------------------------
 GPU_BASE_PRICE = 10000.0
 LVL_BASE_PRICE = 25000.0
@@ -2486,7 +1767,7 @@ LVL_BASE_PRICE = 25000.0
 async def get_or_create_farm(user_id: int):
     now = int(time.time())
     await bot_db.execute(
-        "INSERT OR IGNORE INTO mining_farms (user_id, level, gpu_count, last_collect, durability) VALUES (?, 1, 1, ?, 100)",
+        "INSERT OR IGNORE INTO mining_farms (user_id, level, gpu_count, last_collect, collections_count, is_broken) VALUES (?, 1, 1, ?, 0, 0)",
         (user_id, now)
     )
     await bot_db.commit()
@@ -2498,443 +1779,649 @@ def calculate_farm_income(level: int, gpu_count: int, last_collect: int):
     elapsed_seconds = max(0, now - last_collect)
     income_per_hour = level * gpu_count * 350.0
     accumulated = (income_per_hour / 3600.0) * elapsed_seconds
-    return income_per_hour, min(accumulated, income_per_hour * 24)
+    return accumulated
 
-@dp.message(F.text.lower().startswith(("майнинг", "/mining", "ферма", "бизнес")))
-async def show_mining_farm(message: types.Message):
+def get_repair_cost(level: int, gpu_count: int) -> float:
+    value = (level * LVL_BASE_PRICE) + (gpu_count * GPU_BASE_PRICE)
+    return value * 0.25  # 25% от стоимости на ремонт
+
+@dp.message(F.text.lower().in_(["ферма", "/farm", "майнинг"]))
+async def cmd_farm(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
     farm = await get_or_create_farm(user['tg_id'])
-
-    income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
     
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
-
+    income = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    repair_cost = get_repair_cost(farm['level'], farm['gpu_count'])
+    
+    status_emoji = "💥 СЛОМАНА" if farm['is_broken'] else "✅ РАБОТАЕТ"
     text = (
-        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
-        f"👤 Владелец: @{user['username']}\n"
-        f"⚡ Уровень системы: **{farm['level']}**\n"
-        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
-        f"🛠 Износ оборудования: **{farm['durability']}%**\n"
-        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
-        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
-        f"💡 *(С удержанием 8% на электричество/аренду)*\n\n"
-        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
-        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+        f"💻 **Майнинг-Ферма пользователя @{user['username']}**\n\n"
+        f"📈 Уровень: {farm['level']}\n"
+        f"🖥 Видеокарты (GPU): {farm['gpu_count']}\n"
+        f"⚡ Статус: {status_emoji}\n"
+        f"⚙️ Износ: {farm['collections_count']}/10 сборов\n\n"
+        f"💰 Накоплено: `{income:,.2f}` GHRAM"
     )
-
-    kb = build_mining_keyboard(user['tg_id'], gpu_cost, lvl_cost, farm['durability'])
-    await message.reply(text, parse_mode="Markdown", reply_markup=kb)
+    kb = build_mining_keyboard(user['tg_id'], GPU_BASE_PRICE * farm['gpu_count'], LVL_BASE_PRICE * farm['level'], bool(farm['is_broken']), repair_cost)
+    await message.reply(text, reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("farm_claim:"))
-async def cb_farm_claim(callback: types.CallbackQuery):
+async def callback_farm_claim(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         await callback.answer("❌ Это не ваша ферма!", show_alert=True)
         return
 
-    farm = await get_or_create_farm(owner_id)
-    if farm['durability'] <= 0:
-        await callback.answer("🚨 Ваше оборудование сломано (0% прочности)! Отремонтируйте его.", show_alert=True)
+    user = await get_or_create_user(callback.from_user.id)
+    farm = await get_or_create_farm(user['tg_id'])
+
+    if farm['is_broken']:
+        await callback.answer("🛠 Ваша ферма сломана! Требуется ремонт оборудования.", show_alert=True)
         return
 
-    _, accumulated = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
-
-    if accumulated < 1.0:
-        await callback.answer("⏳ Слишком мало накопилось для сбора!", show_alert=True)
+    income = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    if income < 1.0:
+        await callback.answer("⏳ Накоплено слишком мало (минимум 1.0 GHRAM)!", show_alert=True)
         return
 
-    # Автоматическое удержание 8% на электричество и обслуживание
-    maintenance_tax = accumulated * 0.08
-    net_income = accumulated - maintenance_tax
-
-    # Износ прочности на 5% за каждый сбор
-    new_durability = max(0, farm['durability'] - 5)
+    # Налог на электричество/содержание (10%)
+    tax = income * 0.10
+    net_income = income - tax
     now = int(time.time())
 
+    collections_count = farm['collections_count'] + 1
+    is_broken = 1 if collections_count >= 10 else 0
+
     await bot_db.execute(
-        "UPDATE mining_farms SET last_collect = ?, durability = ? WHERE user_id = ?",
-        (now, new_durability, owner_id)
+        "UPDATE mining_farms SET last_collect = ?, collections_count = ?, is_broken = ? WHERE user_id = ?",
+        (now, collections_count, is_broken, user['tg_id'])
     )
     await bot_db.commit()
 
-    await update_balance(owner_id, net_income)
-    await add_history(owner_id, "Сбор дохода фермы", net_income)
+    await update_balance(user['tg_id'], net_income)
+    await add_history(user['tg_id'], "Сбор с фермы", net_income)
 
-    await callback.answer(f"⚡ Собрано `{net_income:,.2f}` GHRAM (Удержан налог {maintenance_tax:,.2f} GHRAM)!", show_alert=True)
+    msg = f"⚡ Вы собрали прибыль!\n💰 Получено: {net_income:,.2f} GHRAM\n💸 Удержано на электричество (10%): {tax:,.2f}"
+    if is_broken:
+        msg += "\n\n💥 ВНИМАНИЕ! Оборудование сломалось от износа. Требуется ремонт!"
     
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+    await callback.answer(msg, show_alert=True)
     
+    # Обновление меню
+    farm = await get_or_create_farm(user['tg_id'])
+    repair_cost = get_repair_cost(farm['level'], farm['gpu_count'])
+    status_emoji = "💥 СЛОМАНА" if farm['is_broken'] else "✅ РАБОТАЕТ"
     text = (
-        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
-        f"⚡ Уровень системы: **{farm['level']}**\n"
-        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
-        f"🛠 Износ оборудования: **{new_durability}%**\n\n"
-        f"🔋 **Незабранный майнинг:** `0.00` GHRAM\n"
-        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
-        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+        f"💻 **Майнинг-Ферма пользователя @{user['username']}**\n\n"
+        f"📈 Уровень: {farm['level']}\n"
+        f"🖥 Видеокарты (GPU): {farm['gpu_count']}\n"
+        f"⚡ Статус: {status_emoji}\n"
+        f"⚙️ Износ: {farm['collections_count']}/10 сборов\n\n"
+        f"💰 Накоплено: `0.00` GHRAM"
     )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_mining_keyboard(owner_id, gpu_cost, lvl_cost, new_durability))
+    kb = build_mining_keyboard(user['tg_id'], GPU_BASE_PRICE * farm['gpu_count'], LVL_BASE_PRICE * farm['level'], bool(farm['is_broken']), repair_cost)
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data.startswith("farm_repair:"))
-async def cb_farm_repair(callback: types.CallbackQuery):
+async def callback_farm_repair(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         await callback.answer("❌ Это не ваша ферма!", show_alert=True)
         return
 
-    farm = await get_or_create_farm(owner_id)
-    if farm['durability'] >= 100:
-        await callback.answer("Ваша ферма в идеальном состоянии (100%)!", show_alert=True)
+    user = await get_or_create_user(callback.from_user.id)
+    farm = await get_or_create_farm(user['tg_id'])
+
+    if not farm['is_broken']:
+        await callback.answer("✅ Ваша ферма работает исправно, ремонт не нужен!", show_alert=True)
         return
 
-    user = await get_or_create_user(owner_id, callback.from_user.username)
-    
-    # Стоимость ремонта = 25% от общей стоимости улучшения фермы
-    total_farm_val = (farm['level'] * LVL_BASE_PRICE) + (farm['gpu_count'] * GPU_BASE_PRICE)
-    repair_cost = total_farm_val * 0.25
-
-    if not check_balance(owner_id, user['balance'], repair_cost):
-        await callback.answer(f"❌ Недостаточно монет для ремонта! Нужно: {repair_cost:,.0f} GHRAM", show_alert=True)
+    repair_cost = get_repair_cost(farm['level'], farm['gpu_count'])
+    if not check_balance(user['tg_id'], user['balance'], repair_cost):
+        await callback.answer(f"❌ Недостаточно средств для ремонта! Нужно: {repair_cost:,.2f}", show_alert=True)
         return
 
-    await update_balance(owner_id, -repair_cost)
-    await bot_db.execute("UPDATE mining_farms SET durability = 100 WHERE user_id = ?", (owner_id,))
+    await update_balance(user['tg_id'], -repair_cost)
+    await bot_db.execute(
+        "UPDATE mining_farms SET is_broken = 0, collections_count = 0, last_collect = ? WHERE user_id = ?",
+        (int(time.time()), user['tg_id'])
+    )
     await bot_db.commit()
 
-    await callback.answer(f"🛠 Оборудование отремонтировано до 100% за {repair_cost:,.0f} GHRAM!", show_alert=True)
-
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+    await add_history(user['tg_id'], "Ремонт фермы", -repair_cost)
+    await callback.answer("🛠 Ферма успешно отремонтирована и снова приносит доход!", show_alert=True)
     
-    await callback.message.edit_reply_markup(reply_markup=build_mining_keyboard(owner_id, gpu_cost, lvl_cost, 100))
+    # Refresh
+    farm = await get_or_create_farm(user['tg_id'])
+    kb = build_mining_keyboard(user['tg_id'], GPU_BASE_PRICE * farm['gpu_count'], LVL_BASE_PRICE * farm['level'], False, 0)
+    await callback.message.edit_text(
+        f"💻 **Майнинг-Ферма пользователя @{user['username']}**\n\n"
+        f"📈 Уровень: {farm['level']}\n"
+        f"🖥 Видеокарты (GPU): {farm['gpu_count']}\n"
+        f"⚡ Статус: ✅ РАБОТАЕТ\n"
+        f"⚙️ Износ: 0/10 сборов\n\n"
+        f"💰 Накоплено: `0.00` GHRAM", 
+        reply_markup=kb, parse_mode="Markdown"
+    )
 
 @dp.callback_query(F.data.startswith("farm_buy_gpu:"))
-async def cb_farm_buy_gpu(callback: types.CallbackQuery):
+async def callback_farm_buy_gpu(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         await callback.answer("❌ Это не ваша ферма!", show_alert=True)
         return
 
-    farm = await get_or_create_farm(owner_id)
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
-    
-    user = await get_or_create_user(owner_id, callback.from_user.username)
-    if not check_balance(owner_id, user['balance'], gpu_cost):
-        await callback.answer(f"❌ Недостаточно средств! Нужно: {gpu_cost:,.0f} GHRAM", show_alert=True)
+    user = await get_or_create_user(callback.from_user.id)
+    farm = await get_or_create_farm(user['tg_id'])
+    cost = GPU_BASE_PRICE * farm['gpu_count']
+
+    if not check_balance(user['tg_id'], user['balance'], cost):
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {cost:,.2f}", show_alert=True)
         return
 
-    await update_balance(owner_id, -gpu_cost)
-    await bot_db.execute("UPDATE mining_farms SET gpu_count = gpu_count + 1 WHERE user_id = ?", (owner_id,))
+    await update_balance(user['tg_id'], -cost)
+    await bot_db.execute("UPDATE mining_farms SET gpu_count = gpu_count + 1 WHERE user_id = ?", (user['tg_id'],))
     await bot_db.commit()
-
-    await callback.answer("🛒 Куплена 1 новая видеокарта!", show_alert=True)
-    
-    new_farm = await get_or_create_farm(owner_id)
-    new_gpu_cost = GPU_BASE_PRICE * (1.35 ** (new_farm['gpu_count'] - 1))
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (new_farm['level'] - 1))
-    
-    income_per_hour, uncollected = calculate_farm_income(new_farm['level'], new_farm['gpu_count'], new_farm['last_collect'])
-
-    text = (
-        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
-        f"⚡ Уровень системы: **{new_farm['level']}**\n"
-        f"🧩 Видеокарт (GPU): **{new_farm['gpu_count']} шт.**\n"
-        f"🛠 Износ оборудования: **{new_farm['durability']}%**\n"
-        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
-        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
-        f"🛒 Цена новой GPU: `{new_gpu_cost:,.0f}` GHRAM\n"
-        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
-    )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_mining_keyboard(owner_id, new_gpu_cost, lvl_cost, new_farm['durability']))
+    await callback.answer("✅ Успешно куплена новая видеокарта!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("farm_upgrade_lvl:"))
-async def cb_farm_upgrade_lvl(callback: types.CallbackQuery):
+async def callback_farm_upgrade_lvl(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         await callback.answer("❌ Это не ваша ферма!", show_alert=True)
         return
 
-    farm = await get_or_create_farm(owner_id)
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
-    
-    user = await get_or_create_user(owner_id, callback.from_user.username)
-    if not check_balance(owner_id, user['balance'], lvl_cost):
-        await callback.answer(f"❌ Недостаточно средств! Нужно: {lvl_cost:,.0f} GHRAM", show_alert=True)
+    user = await get_or_create_user(callback.from_user.id)
+    farm = await get_or_create_farm(user['tg_id'])
+    cost = LVL_BASE_PRICE * farm['level']
+
+    if not check_balance(user['tg_id'], user['balance'], cost):
+        await callback.answer(f"❌ Недостаточно средств! Нужно: {cost:,.2f}", show_alert=True)
         return
 
-    await update_balance(owner_id, -lvl_cost)
-    await bot_db.execute("UPDATE mining_farms SET level = level + 1 WHERE user_id = ?", (owner_id,))
+    await update_balance(user['tg_id'], -cost)
+    await bot_db.execute("UPDATE mining_farms SET level = level + 1 WHERE user_id = ?", (user['tg_id'],))
     await bot_db.commit()
-
-    await callback.answer("⬆️ Уровень майнинг-системы повышен!", show_alert=True)
-    
-    new_farm = await get_or_create_farm(owner_id)
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (new_farm['gpu_count'] - 1))
-    new_lvl_cost = LVL_BASE_PRICE * (1.60 ** (new_farm['level'] - 1))
-    
-    income_per_hour, uncollected = calculate_farm_income(new_farm['level'], new_farm['gpu_count'], new_farm['last_collect'])
-
-    text = (
-        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
-        f"⚡ Уровень системы: **{new_farm['level']}**\n"
-        f"🧩 Видеокарт (GPU): **{new_farm['gpu_count']} шт.**\n"
-        f"🛠 Износ оборудования: **{new_farm['durability']}%**\n"
-        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
-        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
-        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
-        f"⬆️ Улучшение фермы: `{new_lvl_cost:,.0f}` GHRAM"
-    )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_mining_keyboard(owner_id, gpu_cost, new_lvl_cost, new_farm['durability']))
+    await callback.answer("✅ Уровень фермы повышен!", show_alert=True)
 
 @dp.callback_query(F.data.startswith("farm_refresh:"))
-async def cb_farm_refresh(callback: types.CallbackQuery):
+async def callback_farm_refresh(callback: types.CallbackQuery):
     owner_id = int(callback.data.split(":")[1])
     if callback.from_user.id != owner_id:
         await callback.answer("❌ Это не ваша ферма!", show_alert=True)
         return
 
-    farm = await get_or_create_farm(owner_id)
-    gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
-    lvl_cost = LVL_BASE_PRICE * (1.60 ** (farm['level'] - 1))
+    user = await get_or_create_user(callback.from_user.id)
+    farm = await get_or_create_farm(user['tg_id'])
+    income = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
+    repair_cost = get_repair_cost(farm['level'], farm['gpu_count'])
     
-    income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'])
-
+    status_emoji = "💥 СЛОМАНА" if farm['is_broken'] else "✅ РАБОТАЕТ"
     text = (
-        f"🖥️ **Бизнес: Майнинг-Ферма**\n\n"
-        f"⚡ Уровень системы: **{farm['level']}**\n"
-        f"🧩 Видеокарт (GPU): **{farm['gpu_count']} шт.**\n"
-        f"🛠 Износ оборудования: **{farm['durability']}%**\n"
-        f"📈 Общий доход: `{income_per_hour:,.2f}` GHRAM/час\n\n"
-        f"🔋 **Незабранный майнинг:** `{uncollected:,.2f}` GHRAM\n"
-        f"🛒 Цена новой GPU: `{gpu_cost:,.0f}` GHRAM\n"
-        f"⬆️ Улучшение фермы: `{lvl_cost:,.0f}` GHRAM"
+        f"💻 **Майнинг-Ферма пользователя @{user['username']}**\n\n"
+        f"📈 Уровень: {farm['level']}\n"
+        f"🖥 Видеокарты (GPU): {farm['gpu_count']}\n"
+        f"⚡ Статус: {status_emoji}\n"
+        f"⚙️ Износ: {farm['collections_count']}/10 сборов\n\n"
+        f"💰 Накоплено: `{income:,.2f}` GHRAM"
     )
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=build_mining_keyboard(owner_id, gpu_cost, lvl_cost, farm['durability']))
-    await callback.answer("Обновлено!")
-
-# ----------------------------------------------------
-# 10. КЛАНЫ (СОЗДАНИЕ ЗА 1 МЛН GHRAM, УПРАВЛЕНИЕ)
-# ----------------------------------------------------
-CLAN_CREATION_PRICE = 1_000_000.0
-
-@dp.message(F.text.lower().startswith(("создать клан", "/clan_create")))
-async def cmd_create_clan(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    parts = message.text.split(maxsplit=2)
-
-    if len(parts) < 2 if message.text.startswith("/clan_create") else len(parts) < 3:
-        await message.reply("⚔️ Использование: `создать клан [название]` (Стоимость: 1,000,000 GHRAM)")
-        return
-
-    clan_name = parts[-1].strip()
-    if len(clan_name) < 3 or len(clan_name) > 20:
-        await message.reply("❌ Название клана должно быть от 3 до 20 символов!")
-        return
-
-    if user['clan_id'] and user['clan_id'] > 0:
-        await message.reply("❌ Вы уже состоите в клане! Сначала покиньте текущий клан.")
-        return
-
-    if not check_balance(user['tg_id'], user['balance'], CLAN_CREATION_PRICE):
-        await message.reply(f"❌ Для создания клана требуется `{CLAN_CREATION_PRICE:,.0f}` GHRAM!")
-        return
-
+    kb = build_mining_keyboard(user['tg_id'], GPU_BASE_PRICE * farm['gpu_count'], LVL_BASE_PRICE * farm['level'], bool(farm['is_broken']), repair_cost)
     try:
-        now = int(time.time())
-        cursor = await bot_db.execute(
-            "INSERT INTO clans (name, owner_id, balance, created_at) VALUES (?, ?, 0.0, ?)",
-            (clan_name, user['tg_id'], now)
-        )
-        clan_id = cursor.lastrowid
-        
-        await bot_db.execute("UPDATE users SET clan_id = ? WHERE tg_id = ?", (clan_id, user['tg_id']))
-        await bot_db.commit()
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    except Exception:
+        pass
+    await callback.answer("Обновлено")
 
-        await update_balance(user['tg_id'], -CLAN_CREATION_PRICE)
-        await add_history(user['tg_id'], "Создание клана", -CLAN_CREATION_PRICE)
+# ----------------------------------------------------
+# 10. НОВЫЕ ИГРЫ (Монетка, Кости, Слоты, Блекджек, Крестики-Нолики)
+# ----------------------------------------------------
 
-        await message.reply(f"🎉 **Клан «{clan_name}» успешно создан!**\nВы стали его главой.", parse_mode="Markdown")
-    except aiosqlite.IntegrityError:
-        await message.reply("❌ Клан с таким названием уже существует!")
-
-@dp.message(F.text.lower().in_(["клан", "мой клан", "/clan", "кланы"]))
-async def show_clan_info(message: types.Message):
+# --- МОНЕТКА (PvE) ---
+@dp.message(F.text.lower().startswith("монетка"))
+async def game_coinflip(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    parts = message.text.lower().split()
+    if len(parts) < 3 or parts[1] not in ["орел", "орёл", "решка"]:
+        await message.reply("🪙 Использование: `монетка [орел/решка] [ставка]`", parse_mode="Markdown")
+        return
     
-    if not user['clan_id'] or user['clan_id'] == 0:
-        text = (
-            "⚔️ **Клановая Система GHRAM**\n\n"
-            "Вы пока не состоите ни в одном клане.\n\n"
-            "• Создать свой клан: `создать клан [название]` (1,000,000 GHRAM)\n"
-            "• Посмотреть топ кланов: `топ кланов`"
-        )
-        await message.reply(text, parse_mode="Markdown")
+    bet = parse_amount(parts[2], user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств или неверная сумма!")
         return
 
-    async with bot_db.execute("SELECT * FROM clans WHERE id = ?", (user['clan_id'],)) as cursor:
-        clan = await cursor.fetchone()
+    choice = "орел" if parts[1] in ["орел", "орёл"] else "решка"
+    await update_balance(user['tg_id'], -bet)
 
-    if not clan:
-        await bot_db.execute("UPDATE users SET clan_id = 0 WHERE tg_id = ?", (user['tg_id'],))
-        await bot_db.commit()
-        await message.reply("❌ Ваш клан был распущен.")
-        return
+    result = secrets.choice(["орел", "решка"])
+    
+    # House Edge: Выплата 1.95x
+    win_amount = bet * 1.95
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Повторить", switch_inline_query_current_chat=f"монетка {choice} {bet}")]])
 
-    async with bot_db.execute("SELECT tg_id, username FROM users WHERE clan_id = ?", (user['clan_id'],)) as cursor:
-        members = await cursor.fetchall()
+    if result == choice:
+        await update_balance(user['tg_id'], win_amount)
+        await add_history(user['tg_id'], "Монетка (Победа)", win_amount - bet)
+        text = f"🪙 Монетка подброшена...\nВыпал **{result.upper()}**!\n\n🎉 Вы угадали и выиграли **{win_amount:,.2f}** GHRAM!"
+    else:
+        await add_history(user['tg_id'], "Монетка (Поражение)", -bet)
+        text = f"🪙 Монетка подброшена...\nВыпал **{result.upper()}**!\n\n💥 Вы не угадали, ставка сгорела."
 
-    owner = await get_or_create_user(clan['owner_id'])
-    owner_name = f"@{owner['username']}" if owner['username'] else f"ID {owner['tg_id']}"
+    await message.reply(text, parse_mode="Markdown", reply_markup=kb)
 
-    members_str = "\n".join([f"• @{m['username']}" if m['username'] else f"• ID {m['tg_id']}" for m in members[:15]])
-
-    text = (
-        f"⚔️ **Клан: «{clan['name']}»**\n\n"
-        f"👑 Глава: {owner_name}\n"
-        f"💰 Казна клана: `{clan['balance']:,.2f}` GHRAM\n"
-        f"👥 Участников: **{len(members)}**\n\n"
-        f"📋 **Состав клана:**\n{members_str}\n\n"
-        f"💡 Команды клана:\n"
-        f"• `положить [сумма]` — пополнить казну клана\n"
-        f"• `пригласить [@username]` — пригласить игрока\n"
-        f"• `покинуть клан` — выйти из клана"
-    )
-    await message.reply(text, parse_mode="Markdown")
-
-@dp.message(F.text.lower().startswith(("положить", "депозит клан", "/clan_deposit")))
-async def clan_deposit(message: types.Message):
+# --- КОСТИ PvE ---
+@dp.message(F.text.lower().startswith("кости"))
+async def game_dice_pve(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    if not user['clan_id'] or user['clan_id'] == 0:
-        await message.reply("❌ Вы не состоите в клане!")
-        return
-
     parts = message.text.split()
     if len(parts) < 2:
-        await message.reply("✍️ Использование: `положить [сумма]`")
+        await message.reply("🎲 Использование: `кости [ставка]`\nКто выбросит больше — тот и победил!", parse_mode="Markdown")
+        return
+        
+    bet = parse_amount(parts[1], user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств или неверная сумма!")
         return
 
-    amount = parse_amount(parts[1], user['balance'])
-    if not amount or amount <= 0 or not check_balance(user['tg_id'], user['balance'], amount):
-        await message.reply("❌ Недостаточно средств на балансе!")
-        return
+    await update_balance(user['tg_id'], -bet)
 
-    await update_balance(user['tg_id'], -amount)
-    await bot_db.execute("UPDATE clans SET balance = balance + ? WHERE id = ?", (amount, user['clan_id']))
-    await bot_db.commit()
+    msg = await message.reply("🎲 Бот бросает кости...")
+    bot_dice = await msg.answer_dice(emoji="🎲")
+    await asyncio.sleep(2)
+    
+    user_msg = await msg.answer(f"@{user['username']}, теперь ваш бросок!")
+    user_dice = await user_msg.answer_dice(emoji="🎲")
+    await asyncio.sleep(3)
 
-    await add_history(user['tg_id'], "Взнос в казну клана", -amount)
-    await message.reply(f"✅ Вы внесли `{amount:,.2f}` GHRAM в казну клана!", parse_mode="Markdown")
+    bot_val = bot_dice.dice.value
+    user_val = user_dice.dice.value
+    
+    if user_val > bot_val:
+        win_amount = bet * 1.95 # House Edge
+        await update_balance(user['tg_id'], win_amount)
+        await add_history(user['tg_id'], "Кости PvE (Победа)", win_amount - bet)
+        res = f"🎉 **Вы победили!**\nСчет: Вы ({user_val}) - Бот ({bot_val})\n💰 Выигрыш: {win_amount:,.2f} GHRAM"
+    elif user_val < bot_val:
+        await add_history(user['tg_id'], "Кости PvE (Поражение)", -bet)
+        res = f"💥 **Вы проиграли!**\nСчет: Вы ({user_val}) - Бот ({bot_val})"
+    else:
+        await update_balance(user['tg_id'], bet) # Ничья - возврат ставки
+        res = f"🤝 **Ничья!**\nСчет: Вы ({user_val}) - Бот ({bot_val})\n💸 Ставка возвращена."
 
-@dp.message(F.text.lower().startswith(("пригласить", "/clan_invite")))
-async def clan_invite(message: types.Message):
+    await msg.answer(res, parse_mode="Markdown")
+
+# --- СЛОТЫ (Interactive 92% RTP) ---
+@dp.message(F.text.lower().startswith("слоты"))
+async def game_slots(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    if not user['clan_id'] or user['clan_id'] == 0:
-        await message.reply("❌ Вы не состоите в клане!")
-        return
-
     parts = message.text.split()
-    target_user = None
-
-    if message.reply_to_message:
-        target_user = await get_or_create_user(message.reply_to_message.from_user.id, message.reply_to_message.from_user.username)
-    elif len(parts) >= 2:
-        target_user = await get_user_by_identifier(parts[1])
-
-    if not target_user:
-        await message.reply("❌ Укажите игрока для приглашения!")
+    if len(parts) < 2:
+        await message.reply("🎰 Использование: `слоты [ставка]`\nВыиграй до 100х!", parse_mode="Markdown")
+        return
+        
+    bet = parse_amount(parts[1], user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств или неверная сумма!")
         return
 
-    if target_user['clan_id'] and target_user['clan_id'] > 0:
-        await message.reply("❌ Игрок уже состоит в другом клане!")
+    await update_balance(user['tg_id'], -bet)
+
+    # Строгая математика RTP = ~92%
+    # Шансы:
+    # 🎰🎰🎰 (100x) - 0.2%
+    # 💎💎💎 (25x) - 1.0%
+    # 🍉🍉🍉 (10x) - 2.0%
+    # 🍋🍋🍋 (5x) - 3.0%
+    # 🍒🍒🍒 (2x) - 6.0%
+    # Проигрыш (0x) - 87.8% 
+    # Итоговое матожидание = 92% от ставки
+    
+    r = secrets.randbelow(1000)
+    win_mult = 0
+    symbols = []
+    
+    if r < 2: # 0.2%
+        win_mult = 100
+        symbols = ["🎰", "🎰", "🎰"]
+    elif r < 12: # 1.0%
+        win_mult = 25
+        symbols = ["💎", "💎", "💎"]
+    elif r < 32: # 2.0%
+        win_mult = 10
+        symbols = ["🍉", "🍉", "🍉"]
+    elif r < 62: # 3.0%
+        win_mult = 5
+        symbols = ["🍋", "🍋", "🍋"]
+    elif r < 122: # 6.0%
+        win_mult = 2
+        symbols = ["🍒", "🍒", "🍒"]
+    else:
+        # Проигрыш, генерируем 3 случайных разных/не совпадающих полностью символа
+        options = ["🎰", "💎", "🍉", "🍋", "🍒"]
+        symbols = [secrets.choice(options) for _ in range(3)]
+        if symbols[0] == symbols[1] == symbols[2]:
+            symbols[2] = secrets.choice([s for s in options if s != symbols[0]])
+
+    win_amount = bet * win_mult
+    if win_amount > 0:
+        await update_balance(user['tg_id'], win_amount)
+        await add_history(user['tg_id'], "Слоты (Победа)", win_amount - bet)
+    else:
+        await add_history(user['tg_id'], "Слоты (Поражение)", -bet)
+
+    res_str = f"| {' | '.join(symbols)} |"
+    
+    if win_mult > 0:
+        text = f"🎰 **СЛОТЫ** 🎰\n\n{res_str}\n\n🎉 Комбинация совпала! Выигрыш: **{win_amount:,.2f}** GHRAM ({win_mult}x)"
+    else:
+        text = f"🎰 **СЛОТЫ** 🎰\n\n{res_str}\n\n💥 Ничего не совпало. Попробуйте еще раз!"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Крутить еще", switch_inline_query_current_chat=f"слоты {bet}")]])
+    await message.reply(text, parse_mode="Markdown", reply_markup=kb)
+
+
+# --- КРЕСТИКИ-НОЛИКИ (PvP) ---
+@dp.message(F.text.lower().startswith(("крестики", "/ttt")))
+async def game_ttt(message: types.Message):
+    sender = await get_or_create_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split()
+    
+    if len(parts) < 3 or not message.reply_to_message:
+        await message.reply("⭕️ Крестики-нолики PvP\nИспользуйте: `крестики [ставка]` ответом на сообщение игрока!")
+        return
+        
+    bet = parse_amount(parts[1], sender['balance'])
+    if not bet or bet <= 0:
+        await message.reply("❌ Неверная ставка!")
+        return
+        
+    target_id = message.reply_to_message.from_user.id
+    if target_id == sender['tg_id']:
+        await message.reply("❌ Нельзя играть с самим собой!")
         return
 
-    async with bot_db.execute("SELECT name FROM clans WHERE id = ?", (user['clan_id'],)) as cursor:
-        clan = await cursor.fetchone()
+    target_user = await get_or_create_user(target_id, message.reply_to_message.from_user.username)
+
+    if not check_balance(sender['tg_id'], sender['balance'], bet):
+        await message.reply("❌ У вас недостаточно монет!")
+        return
+    if not check_balance(target_user['tg_id'], target_user['balance'], bet):
+        await message.reply("❌ У соперника недостаточно монет!")
+        return
+
+    game_id = secrets.token_hex(4)
+    pending_ttt_games[game_id] = {
+        "p1": sender['tg_id'], "p1_name": sender['username'],
+        "p2": target_id, "p2_name": target_user['username'],
+        "bet": bet
+    }
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Принять ✅", callback_data=f"clan_acc:{user['clan_id']}:{target_user['tg_id']}"),
-        InlineKeyboardButton(text="Отклонить ⛔", callback_data=f"clan_dec:{target_user['tg_id']}")
+        InlineKeyboardButton(text="Принять ✅", callback_data=f"ttt_acc:{game_id}"),
+        InlineKeyboardButton(text="Отклонить ⛔", callback_data=f"ttt_dec:{game_id}")
     ]])
 
-    target_mention = f"@{target_user['username']}" if target_user['username'] else f"ID {target_user['tg_id']}"
-    await message.reply(
-        f"✉️ {target_mention}, вас приглашают вступить в клан **«{clan['name']}»**!",
-        reply_markup=kb,
-        parse_mode="Markdown"
+    await message.answer(
+        f"⭕️ @{target_user['username']}, вас вызывают в Крестики-Нолики!\n"
+        f"💰 Ставка: **{bet:,.2f}** GHRAM", reply_markup=kb, parse_mode="Markdown"
     )
 
-@dp.callback_query(F.data.startswith("clan_acc:"))
-async def cb_clan_accept(callback: types.CallbackQuery):
+def build_ttt_keyboard(board, game_id):
+    kb = []
+    for row in range(3):
+        line = []
+        for col in range(3):
+            idx = row * 3 + col
+            val = board[idx]
+            text = " " if val == 0 else ("❌" if val == 1 else "⭕️")
+            line.append(InlineKeyboardButton(text=text, callback_data=f"ttt_c:{game_id}:{idx}"))
+        kb.append(line)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def check_ttt_win(b):
+    lines = [(0,1,2),(3,4,5),(6,7,8),(0,3,6),(1,4,7),(2,5,8),(0,4,8),(2,4,6)]
+    for (x,y,z) in lines:
+        if b[x] != 0 and b[x] == b[y] == b[z]:
+            return b[x]
+    if 0 not in b:
+        return -1 # ничья
+    return 0
+
+@dp.callback_query(F.data.startswith("ttt_acc:"))
+async def ttt_accept(callback: types.CallbackQuery):
+    game_id = callback.data.split(":")[1]
+    if game_id not in pending_ttt_games:
+        await callback.answer("Игра не найдена!", show_alert=True)
+        return
+    g = pending_ttt_games[game_id]
+    if callback.from_user.id != g["p2"]:
+        await callback.answer("❌ Это вызов не вам!", show_alert=True)
+        return
+        
+    if not check_balance(g["p1"], (await get_or_create_user(g["p1"]))['balance'], g["bet"]):
+        await callback.answer("У соперника не хватает средств!", show_alert=True)
+        return
+    if not check_balance(g["p2"], (await get_or_create_user(g["p2"]))['balance'], g["bet"]):
+        await callback.answer("У вас не хватает средств!", show_alert=True)
+        return
+
+    await update_balance(g["p1"], -g["bet"])
+    await update_balance(g["p2"], -g["bet"])
+
+    del pending_ttt_games[game_id]
+    active_ttt_games[game_id] = {
+        "p1": g["p1"], "p2": g["p2"],
+        "p1_name": g["p1_name"], "p2_name": g["p2_name"],
+        "bet": g["bet"], "board": [0]*9, "turn": 1 # 1 = p1(❌), 2 = p2(⭕️)
+    }
+
+    kb = build_ttt_keyboard([0]*9, game_id)
+    await callback.message.edit_text(f"❌ Ход @{g['p1_name']}\n💰 Банк: {g['bet']*2:,.2f}", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("ttt_dec:"))
+async def ttt_decline(callback: types.CallbackQuery):
+    game_id = callback.data.split(":")[1]
+    if game_id in pending_ttt_games:
+        if callback.from_user.id == pending_ttt_games[game_id]["p2"]:
+            del pending_ttt_games[game_id]
+            await callback.message.edit_text("⛔ Игра отклонена.")
+        else:
+            await callback.answer("Не вам!", show_alert=True)
+
+@dp.callback_query(F.data.startswith("ttt_c:"))
+async def ttt_click(callback: types.CallbackQuery):
     parts = callback.data.split(":")
-    clan_id = int(parts[1])
-    target_id = int(parts[2])
-
-    if callback.from_user.id != target_id:
-        await callback.answer("❌ Это приглашение не для вас!", show_alert=True)
+    game_id = parts[1]
+    cell = int(parts[2])
+    
+    if game_id not in active_ttt_games:
+        await callback.answer("Игра завершена!", show_alert=True)
+        return
+        
+    g = active_ttt_games[game_id]
+    user_id = callback.from_user.id
+    
+    expected_id = g["p1"] if g["turn"] == 1 else g["p2"]
+    if user_id != expected_id:
+        await callback.answer("Сейчас не ваш ход!", show_alert=True)
+        return
+        
+    if g["board"][cell] != 0:
+        await callback.answer("Клетка занята!", show_alert=True)
         return
 
-    await bot_db.execute("UPDATE users SET clan_id = ? WHERE tg_id = ?", (clan_id, target_id))
-    await bot_db.commit()
-
-    await callback.message.edit_text("🎉 Вы успешно вступили в клан!")
-    await callback.answer("Добро пожаловать в клан!")
-
-@dp.callback_query(F.data.startswith("clan_dec:"))
-async def cb_clan_decline(callback: types.CallbackQuery):
-    target_id = int(callback.data.split(":")[1])
-    if callback.from_user.id != target_id:
-        await callback.answer("❌ Это приглашение не для вас!", show_alert=True)
-        return
-
-    await callback.message.edit_text("⛔ Приглашение в клан отклонено.")
-    await callback.answer("Отклонено")
-
-@dp.message(F.text.lower().in_(["покинуть клан", "/clan_leave", "выйти из клана"]))
-async def clan_leave(message: types.Message):
-    user = await get_or_create_user(message.from_user.id, message.from_user.username)
-    if not user['clan_id'] or user['clan_id'] == 0:
-        await message.reply("❌ Вы не состоите в клане!")
-        return
-
-    async with bot_db.execute("SELECT owner_id FROM clans WHERE id = ?", (user['clan_id'],)) as cursor:
-        clan = await cursor.fetchone()
-
-    if clan and clan['owner_id'] == user['tg_id']:
-        await message.reply("❌ Глава клана не может покинуть клан! Вы можете только распустить его.")
-        return
-
-    await bot_db.execute("UPDATE users SET clan_id = 0 WHERE tg_id = ?", (user['tg_id'],))
-    await bot_db.commit()
-
-    await message.reply("🚪 Вы успешно покинули клан.")
-
-@dp.message(F.text.lower().startswith(("топ кланов", "/topclans")))
-async def top_clans(message: types.Message):
-    async with bot_db.execute("SELECT name, balance FROM clans ORDER BY balance DESC LIMIT 10") as cursor:
-        clans = await cursor.fetchall()
-
-    if not clans:
-        await message.reply("🏆 Пока нет ни одного созданного клана!")
-        return
-
-    text = "🏆 **Топ-10 Кланов по казне:**\n\n"
-    for idx, c in enumerate(clans, start=1):
-        text += f"{idx}. **{c['name']}** — `{c['balance']:,.2f}` GHRAM\n"
-
-    await message.reply(text, parse_mode="Markdown")
+    g["board"][cell] = g["turn"]
+    res = check_ttt_win(g["board"])
+    
+    if res != 0:
+        if res == -1:
+            # Ничья
+            await update_balance(g["p1"], g["bet"])
+            await update_balance(g["p2"], g["bet"])
+            txt = f"🤝 **Ничья!** Ставки возвращены."
+        else:
+            winner_id = g["p1"] if res == 1 else g["p2"]
+            loser_id = g["p2"] if res == 1 else g["p1"]
+            winner_name = g["p1_name"] if res == 1 else g["p2_name"]
+            
+            win_amount = g["bet"] * 1.95 # House Edge 5%
+            await update_balance(winner_id, win_amount)
+            txt = f"🎉 Победитель: @{winner_name}\n💰 Выигрыш: {win_amount:,.2f} GHRAM"
+        
+        del active_ttt_games[game_id]
+        kb = build_ttt_keyboard(g["board"], "done")
+        await callback.message.edit_text(txt, reply_markup=kb, parse_mode="Markdown")
+    else:
+        g["turn"] = 2 if g["turn"] == 1 else 1
+        next_name = g["p1_name"] if g["turn"] == 1 else g["p2_name"]
+        icon = "❌" if g["turn"] == 1 else "⭕️"
+        
+        kb = build_ttt_keyboard(g["board"], game_id)
+        await callback.message.edit_text(f"{icon} Ход @{next_name}\n💰 Банк: {g['bet']*2:,.2f}", reply_markup=kb)
 
 # ----------------------------------------------------
-# 11. ЗАПУСК БОТА
+# 11. КЛАНЫ
+# ----------------------------------------------------
+CLAN_CREATION_COST = 1000000.0
+
+@dp.message(F.text.lower().startswith(("/clan", "клан")))
+async def cmd_clan(message: types.Message):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    parts = message.text.split()
+
+    async with bot_db.execute("SELECT * FROM clan_members WHERE user_id = ?", (user['tg_id'],)) as cursor:
+        my_membership = await cursor.fetchone()
+
+    if len(parts) == 1:
+        if not my_membership:
+            await message.reply(
+                "⚔️ **Система Кланов**\n\n"
+                "Вы не состоиite в клане.\n\n"
+                "Доступные команды:\n"
+                "`/clan create [Имя]` — создать клан (1,000,000 GHRAM)\n"
+                "`/clan info` — информация о текущем клане\n"
+                "`/clan leave` — покинуть клан",
+                parse_mode="Markdown"
+            )
+        else:
+            async with bot_db.execute("SELECT * FROM clans WHERE id = ?", (my_membership['clan_id'],)) as cursor:
+                clan = await cursor.fetchone()
+            async with bot_db.execute("SELECT COUNT(*) FROM clan_members WHERE clan_id = ?", (clan['id'],)) as cursor:
+                members_count = (await cursor.fetchone())[0]
+                
+            await message.reply(
+                f"🛡 **Клан «{clan['name']}»**\n\n"
+                f"👥 Участников: {members_count}\n"
+                f"💰 Казна: `{clan['balance']:,.2f}` GHRAM\n"
+                f"👑 Ваша роль: {my_membership['role']}\n\n"
+                f"Доп. команды: `/clan invite @user`, `/clan deposit [сумма]`",
+                parse_mode="Markdown"
+            )
+        return
+
+    cmd = parts[1].lower()
+
+    if cmd == "create":
+        if my_membership:
+            await message.reply("❌ Вы уже состоите в клане!")
+            return
+        if len(parts) < 3:
+            await message.reply("Укажите имя клана: `/clan create [Имя]`", parse_mode="Markdown")
+            return
+            
+        clan_name = " ".join(parts[2:])
+        if not check_balance(user['tg_id'], user['balance'], CLAN_CREATION_COST):
+            await message.reply(f"❌ Недостаточно средств! Стоимость: {CLAN_CREATION_COST:,.2f} GHRAM")
+            return
+            
+        try:
+            await update_balance(user['tg_id'], -CLAN_CREATION_COST)
+            await bot_db.execute("INSERT INTO clans (name, owner_id, balance, created_at) VALUES (?, ?, 0, ?)", 
+                                 (clan_name, user['tg_id'], int(time.time())))
+            
+            async with bot_db.execute("SELECT id FROM clans WHERE name = ?", (clan_name,)) as cursor:
+                new_clan_id = (await cursor.fetchone())[0]
+                
+            await bot_db.execute("INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
+                                 (new_clan_id, user['tg_id'], int(time.time())))
+            await bot_db.commit()
+            await message.reply(f"✅ Клан **{clan_name}** успешно создан!", parse_mode="Markdown")
+        except Exception:
+            await update_balance(user['tg_id'], CLAN_CREATION_COST)
+            await message.reply("❌ Ошибка! Возможно, имя уже занято.")
+            
+    elif cmd == "leave":
+        if not my_membership:
+            await message.reply("❌ Вы не в клане!")
+            return
+        if my_membership['role'] == 'owner':
+            await message.reply("❌ Владелец не может покинуть клан! (Добавьте функционал расформа позже)")
+            return
+            
+        await bot_db.execute("DELETE FROM clan_members WHERE user_id = ?", (user['tg_id'],))
+        await bot_db.commit()
+        await message.reply("✅ Вы покинули клан.")
+
+    elif cmd == "deposit":
+        if not my_membership:
+            await message.reply("❌ Вы не в клане!")
+            return
+        if len(parts) < 3:
+            await message.reply("Укажите сумму: `/clan deposit [сумма]`", parse_mode="Markdown")
+            return
+        amount = parse_amount(parts[2], user['balance'])
+        if not amount or amount <= 0 or not check_balance(user['tg_id'], user['balance'], amount):
+            await message.reply("❌ Недостаточно средств!")
+            return
+            
+        await update_balance(user['tg_id'], -amount)
+        await bot_db.execute("UPDATE clans SET balance = balance + ? WHERE id = ?", (amount, my_membership['clan_id']))
+        await bot_db.commit()
+        await message.reply(f"✅ Вы внесли `{amount:,.2f}` GHRAM в казну клана!", parse_mode="Markdown")
+
+    elif cmd == "invite":
+        if not my_membership or my_membership['role'] not in ['owner', 'admin']:
+            await message.reply("❌ У вас нет прав приглашать в клан!")
+            return
+        if len(parts) < 3:
+            await message.reply("Кого пригласить? `/clan invite [@user]`", parse_mode="Markdown")
+            return
+            
+        target = await get_user_by_identifier(parts[2])
+        if not target:
+            await message.reply("❌ Пользователь не найден!")
+            return
+            
+        async with bot_db.execute("SELECT * FROM clan_members WHERE user_id = ?", (target['tg_id'],)) as cursor:
+            if await cursor.fetchone():
+                await message.reply("❌ Игрок уже в клане!")
+                return
+                
+        # Мгновенное добавление (для простоты)
+        await bot_db.execute("INSERT INTO clan_members (clan_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)",
+                             (my_membership['clan_id'], target['tg_id'], int(time.time())))
+        await bot_db.commit()
+        await message.reply(f"✅ Пользователь добавлен в клан!")
+
+# ----------------------------------------------------
+# 12. ЗАПУСК БОТА
 # ----------------------------------------------------
 async def main():
     logging.basicConfig(level=logging.INFO)
     await init_db()
     await cleanup_all_active_games()
     asyncio.create_task(periodic_cleanup_task())
-    logging.info("Бот запущен и готов к работе!")
-    await dp.start_polling(bot)
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        if bot_db:
+            await bot_db.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot stopped!")
