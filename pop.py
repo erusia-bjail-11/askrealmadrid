@@ -104,6 +104,11 @@ pending_ttt = {}             # Крестики-нолики (ожидание)
 active_ttt_games = {}        # Крестики-нолики (идёт игра)
 active_slots_spins = set()   # Защита от параллельных вращений слотов
 
+# Футбол / Баскетбол
+active_sport_pve_games = {}  # PvE матчи
+pending_sport_pvp = {}       # PvP матчи в ожидании
+active_sport_pvp = {}        # PvP матчи в процессе
+
 
 # ----------------------------------------------------
 # 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -140,7 +145,6 @@ def parse_amount(text: str, current_balance: float = 0.0) -> float | None:
         return current_balance
 
     multiplier = 1.0
-
     if cleaned.endswith(("kkk", "ккк", "b", "б")):
         multiplier = 1_000_000_000.0
         cleaned = re.sub(r"[kkkкккbб]$", "", cleaned)
@@ -167,11 +171,133 @@ async def get_user_lang(chat_type: str, tg_id: int) -> str:
         row = await cursor.fetchone()
         if row and row[0]:
             return row[0]
-        return "ru"
+    return "ru"
 
 
 def display_name_of(username: str | None) -> str:
     return f"@{username}" if username and username != "Неизвестно" else "Игрок"
+
+
+def html_escape(text: str) -> str:
+    if text is None:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def is_valid_username(username: str | None) -> bool:
+    return bool(username) and username != "Неизвестно" and bool(re.fullmatch(r"[A-Za-z0-9_]+", username))
+
+
+def safe_user_link_html(tg_id: int, username: str | None) -> str:
+    """
+    Возвращает HTML-ссылку на профиль пользователя без обычного @mention.
+    Если username есть — ссылка через https://t.me/username.
+    Если username нет — ссылка через tg://user?id=...
+    """
+    if is_valid_username(username):
+        label = f"@{html_escape(username)}"
+        url = f"https://t.me/{username}"
+    else:
+        label = f"ID {tg_id}"
+        url = f"tg://user?id={tg_id}"
+    return f'<a href="{url}">{label}</a>'
+
+
+def plain_display_name(username: str | None, tg_id: int) -> str:
+    if is_valid_username(username):
+        return f"@{username}"
+    return f"ID {tg_id}"
+
+
+def format_balance_safe(balance: float, tg_id: int) -> str:
+    """
+    Безопасный формат баланса для топа и игр.
+    Не даёт сообщению умереть из-за огромных чисел, NaN, inf и слишком длинной строки.
+    """
+    if tg_id == OWNER_ID:
+        return "∞"
+
+    try:
+        if balance is None:
+            return "0.00"
+
+        # NaN check
+        if balance != balance:
+            return "0.00"
+
+        if balance == float("inf"):
+            return "∞"
+        if balance == float("-inf"):
+            return "-∞"
+
+        text = f"{balance:,.2f}"
+        if len(text) <= 32:
+            return text
+
+        sign = "-" if balance < 0 else ""
+        abs_balance = abs(balance)
+        suffixes = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"]
+        idx = 0
+
+        while abs_balance >= 1000.0 and idx < len(suffixes) - 1:
+            abs_balance /= 1000.0
+            idx += 1
+
+        if idx < len(suffixes):
+            return f"{sign}{abs_balance:,.2f}{suffixes[idx]}"
+
+        return f"{sign}{abs_balance:.3e}"
+    except Exception:
+        return "0.00"
+
+
+async def send_top_chunks(
+    message: types.Message,
+    header_html: str,
+    header_plain: str,
+    lines_html: list,
+    lines_plain: list
+):
+    """
+    Отправляет топ кусками, чтобы сообщение никогда не превышало лимит Telegram.
+    Сначала пробует HTML, затем обычный текст.
+    """
+    chunks_html = []
+    chunks_plain = []
+
+    cur_html = header_html
+    cur_plain = header_plain
+    cur_len = len(header_plain)
+
+    for line_html, line_plain in zip(lines_html, lines_plain):
+        add_len = len(line_plain) + 1
+
+        if cur_len + add_len > 3800 and cur_len != len(header_plain):
+            chunks_html.append(cur_html)
+            chunks_plain.append(cur_plain)
+
+            cont_html = f"{header_html} <i>(продолжение)</i>"
+            cont_plain = f"{header_plain} (продолжение)"
+
+            cur_html = cont_html
+            cur_plain = cont_plain
+            cur_len = len(cont_plain)
+
+        cur_html += f"\n{line_html}"
+        cur_plain += f"\n{line_plain}"
+        cur_len += add_len
+
+    chunks_html.append(cur_html)
+    chunks_plain.append(cur_plain)
+
+    for chunk_html, chunk_plain in zip(chunks_html, chunks_plain):
+        try:
+            await message.answer(chunk_html, parse_mode="HTML")
+        except Exception:
+            try:
+                await message.answer(chunk_plain)
+            except Exception as e:
+                logging.error(f"Failed to send top chunk: {e}")
 
 
 # ----------------------------------------------------
@@ -339,6 +465,7 @@ async def get_or_create_user(tg_id: int, username: str | None = None):
 
 async def get_user_by_identifier(identifier: str):
     identifier = identifier.strip()
+
     if identifier.startswith("@"):
         username = identifier[1:]
         async with bot_db.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)) as cursor:
@@ -396,6 +523,7 @@ async def _remove_game(game_type: str, game_key: str):
 async def cleanup_all_active_games():
     refunded_count = 0
     total_refunded = 0.0
+
     try:
         async with bot_db.execute("SELECT * FROM active_games") as cursor:
             rows = await cursor.fetchall()
@@ -446,11 +574,11 @@ async def cleanup_stale_games():
                     active_roulette_bets[key] = []
             elif game_type == "duel_pending":
                 d = pending_duels.pop(game_key_str, None)
-                if d:
+                if d and d.get("timer_task"):
                     d['timer_task'].cancel()
             elif game_type == "duel_active":
                 d = active_duels.pop(game_key_str, None)
-                if d:
+                if d and d.get("timer_task"):
                     d['timer_task'].cancel()
             elif game_type == "dice":
                 active_dice_games.pop((chat_id, user_id), None)
@@ -460,18 +588,28 @@ async def cleanup_stale_games():
                 active_blackjack_games.pop((chat_id, user_id), None)
             elif game_type == "dicepvp_pending":
                 d = pending_dice_pvp.pop(game_key_str, None)
-                if d:
+                if d and d.get("timer_task"):
                     d['timer_task'].cancel()
             elif game_type == "dicepvp_active":
                 d = active_dice_pvp.pop(game_key_str, None)
-                if d:
+                if d and d.get("timer_task"):
                     d['timer_task'].cancel()
             elif game_type == "ttt_pending":
                 t = pending_ttt.pop(game_key_str, None)
-                if t:
+                if t and t.get("timer_task"):
                     t['timer_task'].cancel()
             elif game_type == "ttt_active":
                 active_ttt_games.pop(game_key_str, None)
+            elif game_type == "sport_pve":
+                active_sport_pve_games.pop(game_key_str, None)
+            elif game_type == "sport_pvp_pending":
+                d = pending_sport_pvp.pop(game_key_str, None)
+                if d and d.get("timer_task"):
+                    d["timer_task"].cancel()
+            elif game_type == "sport_pvp_active":
+                d = active_sport_pvp.pop(game_key_str, None)
+                if d and d.get("timer_task"):
+                    d["timer_task"].cancel()
 
         if rows:
             await bot_db.execute("DELETE FROM active_games WHERE created_at < ?", (stale_time,))
@@ -792,7 +930,8 @@ async def cmd_gamb(message: types.Message):
         d = pending_duels.get(d_id)
         if d and (d['challenger_id'] == target_id or d['target_id'] == target_id):
             d = pending_duels.pop(d_id)
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             await update_balance(d['challenger_id'], d['bet'])
             cancelled_games += 1
             await _remove_game("duel_pending", d_id)
@@ -805,7 +944,8 @@ async def cmd_gamb(message: types.Message):
         d = active_duels.get(d_id)
         if d and (d['p1_id'] == target_id or d['p2_id'] == target_id):
             d = active_duels.pop(d_id)
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             await update_balance(d['p1_id'], d['bet'])
             await update_balance(d['p2_id'], d['bet'])
             cancelled_games += 1
@@ -820,7 +960,8 @@ async def cmd_gamb(message: types.Message):
         d = pending_dice_pvp.get(d_id)
         if d and (d['challenger_id'] == target_id or d['target_id'] == target_id):
             d = pending_dice_pvp.pop(d_id)
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             await update_balance(d['challenger_id'], d['bet'])
             cancelled_games += 1
             await _remove_game("dicepvp_pending", d_id)
@@ -833,7 +974,8 @@ async def cmd_gamb(message: types.Message):
         d = active_dice_pvp.get(d_id)
         if d and (d['p1_id'] == target_id or d['p2_id'] == target_id):
             d = active_dice_pvp.pop(d_id)
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             await update_balance(d['p1_id'], d['bet'])
             await update_balance(d['p2_id'], d['bet'])
             cancelled_games += 1
@@ -847,7 +989,8 @@ async def cmd_gamb(message: types.Message):
         t = pending_ttt.get(t_id)
         if t and (t['challenger_id'] == target_id or t['target_id'] == target_id):
             t = pending_ttt.pop(t_id)
-            t['timer_task'].cancel()
+            if t.get("timer_task"):
+                t['timer_task'].cancel()
             await update_balance(t['challenger_id'], t['bet'])
             cancelled_games += 1
             await _remove_game("ttt_pending", t_id)
@@ -867,6 +1010,44 @@ async def cmd_gamb(message: types.Message):
             await _remove_game("ttt_active", t_id)
             try:
                 await t['msg'].edit_text("🚫 Игра остановлена администратором. Ставки возвращены.")
+            except Exception:
+                pass
+
+    # --- ФУТБОЛ / БАСКЕТБОЛ ---
+    for key in list(active_sport_pve_games.keys()):
+        game = active_sport_pve_games[key]
+        if game['user_id'] == target_id:
+            active_sport_pve_games.pop(key)
+            refund_amount += game['bet']
+            cancelled_games += 1
+            await _remove_game("sport_pve", key)
+
+    for m_id in list(pending_sport_pvp.keys()):
+        d = pending_sport_pvp.get(m_id)
+        if d and (d['challenger_id'] == target_id or d['target_id'] == target_id):
+            d = pending_sport_pvp.pop(m_id)
+            if d.get("timer_task"):
+                d["timer_task"].cancel()
+            await update_balance(d['challenger_id'], d['bet'])
+            cancelled_games += 1
+            await _remove_game("sport_pvp_pending", m_id)
+            try:
+                await d['msg'].edit_text("🚫 Матч отменён администратором.")
+            except Exception:
+                pass
+
+    for m_id in list(active_sport_pvp.keys()):
+        d = active_sport_pvp.get(m_id)
+        if d and (d['p1_id'] == target_id or d['p2_id'] == target_id):
+            d = active_sport_pvp.pop(m_id)
+            if d.get("timer_task"):
+                d["timer_task"].cancel()
+            await update_balance(d['p1_id'], d['bet'])
+            await update_balance(d['p2_id'], d['bet'])
+            cancelled_games += 1
+            await _remove_game("sport_pvp_active", m_id)
+            try:
+                await d['msg'].edit_text("🚫 Матч остановлен администратором. Ставки возвращены.")
             except Exception:
                 pass
 
@@ -1083,20 +1264,40 @@ async def show_top(message: types.Message):
     if len(parts) > 1 and parts[1].isdigit():
         limit = min(int(parts[1]), 50)
 
-    async with bot_db.execute(
-        "SELECT tg_id, username, balance FROM users ORDER BY balance DESC LIMIT ?", (limit,)
-    ) as cursor:
-        users = await cursor.fetchall()
+    try:
+        async with bot_db.execute(
+            "SELECT tg_id, username, balance FROM users ORDER BY balance DESC LIMIT ?",
+            (limit,)
+        ) as cursor:
+            users = await cursor.fetchall()
+    except Exception as e:
+        logging.error(f"Top load error: {e}")
+        await message.reply("❌ Не удалось загрузить топ.")
+        return
 
-    text = f"🏆 *Глобальный топ-{len(users)} игроков:*\n"
+    if not users:
+        await message.reply("🏆 Топ пока пуст.")
+        return
+
     medals = ["🥇", "🥈", "🥉"]
+
+    header_html = f"🏆 <b>Глобальный топ-{len(users)} игроков:</b>"
+    header_plain = f"🏆 Глобальный топ-{len(users)} игроков:"
+
+    lines_html = []
+    lines_plain = []
 
     for idx, u in enumerate(users, start=1):
         icon = medals[idx - 1] if idx <= 3 else f"{idx}."
-        bal_str = get_balance_str(u['tg_id'], u['balance'])
-        text += f"{icon} @{u['username']} — `{bal_str}` монет\n"
 
-    await message.reply(text, parse_mode="Markdown")
+        # Никаких обычных @mention: только ник-ссылка на профиль
+        user_link = safe_user_link_html(u['tg_id'], u['username'])
+        bal = format_balance_safe(u['balance'], u['tg_id'])
+
+        lines_html.append(f"{icon} {user_link} — <code>{html_escape(bal)}</code> монет")
+        lines_plain.append(f"{icon} {plain_display_name(u['username'], u['tg_id'])} — {bal} монет")
+
+    await send_top_chunks(message, header_html, header_plain, lines_html, lines_plain)
 
 
 # --- ПЕРЕВОД (С P2P НАЛОГОМ) ---
@@ -1235,7 +1436,8 @@ async def cmd_stop_all_games(message: types.Message):
     for d_id in list(pending_duels.keys()):
         d = pending_duels[d_id]
         if d['challenger_id'] == user_id and d['chat_id'] == chat_id:
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             pending_duels.pop(d_id)
             refunds.append((user_id, d['bet']))
             await _remove_game("duel_pending", d_id)
@@ -1248,7 +1450,8 @@ async def cmd_stop_all_games(message: types.Message):
     for d_id in list(active_duels.keys()):
         d = active_duels[d_id]
         if user_id in (d['p1_id'], d['p2_id']) and d['chat_id'] == chat_id:
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             active_duels.pop(d_id)
             refunds.append((d['p1_id'], d['bet']))
             refunds.append((d['p2_id'], d['bet']))
@@ -1262,7 +1465,8 @@ async def cmd_stop_all_games(message: types.Message):
     for d_id in list(pending_dice_pvp.keys()):
         d = pending_dice_pvp[d_id]
         if d['challenger_id'] == user_id and d['chat_id'] == chat_id:
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             pending_dice_pvp.pop(d_id)
             refunds.append((user_id, d['bet']))
             await _remove_game("dicepvp_pending", d_id)
@@ -1275,7 +1479,8 @@ async def cmd_stop_all_games(message: types.Message):
     for d_id in list(active_dice_pvp.keys()):
         d = active_dice_pvp[d_id]
         if user_id in (d['p1_id'], d['p2_id']) and d['chat_id'] == chat_id:
-            d['timer_task'].cancel()
+            if d.get("timer_task"):
+                d['timer_task'].cancel()
             active_dice_pvp.pop(d_id)
             refunds.append((d['p1_id'], d['bet']))
             refunds.append((d['p2_id'], d['bet']))
@@ -1289,7 +1494,8 @@ async def cmd_stop_all_games(message: types.Message):
     for t_id in list(pending_ttt.keys()):
         t = pending_ttt[t_id]
         if t['challenger_id'] == user_id and t['chat_id'] == chat_id:
-            t['timer_task'].cancel()
+            if t.get("timer_task"):
+                t['timer_task'].cancel()
             pending_ttt.pop(t_id)
             refunds.append((user_id, t['bet']))
             await _remove_game("ttt_pending", t_id)
@@ -1313,6 +1519,43 @@ async def cmd_stop_all_games(message: types.Message):
                 pass
             break
 
+    # --- ФУТБОЛ / БАСКЕТБОЛ ---
+    for game_key in list(active_sport_pve_games.keys()):
+        game = active_sport_pve_games[game_key]
+        if game['chat_id'] == chat_id and game['user_id'] == user_id:
+            active_sport_pve_games.pop(game_key)
+            refunds.append((user_id, game['bet']))
+            await _remove_game("sport_pve", game_key)
+
+    for m_id in list(pending_sport_pvp.keys()):
+        d = pending_sport_pvp[m_id]
+        if d['chat_id'] == chat_id and user_id in (d['challenger_id'], d['target_id']):
+            if d.get("timer_task"):
+                d["timer_task"].cancel()
+            pending_sport_pvp.pop(m_id)
+            refunds.append((d['challenger_id'], d['bet']))
+            await _remove_game("sport_pvp_pending", m_id)
+            try:
+                await d['msg'].edit_text("🚫 Матч отменён. Ставка возвращена.")
+            except Exception:
+                pass
+            break
+
+    for m_id in list(active_sport_pvp.keys()):
+        d = active_sport_pvp[m_id]
+        if d['chat_id'] == chat_id and user_id in (d['p1_id'], d['p2_id']):
+            if d.get("timer_task"):
+                d["timer_task"].cancel()
+            active_sport_pvp.pop(m_id)
+            refunds.append((d['p1_id'], d['bet']))
+            refunds.append((d['p2_id'], d['bet']))
+            await _remove_game("sport_pvp_active", m_id)
+            try:
+                await d['msg'].edit_text("🚫 Матч отменён. Ставки возвращены обоим игрокам.")
+            except Exception:
+                pass
+            break
+
     if refunds:
         for uid, amt in refunds:
             await update_balance(uid, amt)
@@ -1325,7 +1568,7 @@ async def cmd_stop_all_games(message: types.Message):
                 parse_mode="Markdown"
             )
         else:
-            await message.reply("✅ Активная игра отменена. Ставки возвращены обоим игрокам.")
+            await message.reply("✅ Активная игра отменена. Ставки возвращены участникам.")
     else:
         await message.reply("ℹ️ У вас нет активных игр для отмены.")
 
@@ -1459,7 +1702,9 @@ async def callback_duel_accept(callback: types.CallbackQuery):
         await callback.answer("❌ У вас недостаточно монет для принятия дуэли!", show_alert=True)
         return
 
-    duel["timer_task"].cancel()
+    if duel.get("timer_task"):
+        duel["timer_task"].cancel()
+
     del pending_duels[duel_id]
     await _remove_game("duel_pending", duel_id)
 
@@ -1469,6 +1714,7 @@ async def callback_duel_accept(callback: types.CallbackQuery):
     p2 = (duel["target_id"], duel["target_name"])
 
     first, second = secrets.choice([(p1, p2), (p2, p1)])
+
     first_id, first_name = first
     second_id, second_name = second
 
@@ -1529,9 +1775,12 @@ async def callback_duel_decline(callback: types.CallbackQuery):
         await callback.answer("❌ Отклонить дуэль может только вызванный игрок!", show_alert=True)
         return
 
-    duel["timer_task"].cancel()
+    if duel.get("timer_task"):
+        duel["timer_task"].cancel()
+
     del pending_duels[duel_id]
     await _remove_game("duel_pending", duel_id)
+
     await update_balance(duel["challenger_id"], duel["bet"])
 
     await callback.message.edit_text(f"⛔ {duel['target_name']} отклонил(а) дуэль. Ставка возвращена.")
@@ -1547,7 +1796,8 @@ async def process_duel_shot(duel_id: str, shooter_id: int, message_or_cb):
     if shooter_id != duel["current_turn_id"]:
         return False, "❌ Сейчас не ваш черед стрелять!"
 
-    duel["timer_task"].cancel()
+    if duel.get("timer_task"):
+        duel["timer_task"].cancel()
 
     is_hit = secrets.choice([True, False])
 
@@ -1665,7 +1915,6 @@ async def game_mines(message: types.Message):
         return
 
     game_key = (message.chat.id, message.from_user.id)
-
     if game_key in active_mines_games:
         await message.reply("❌ У вас уже есть активная игра в мины! Закончите её или напишите `/стоп` для отмены.")
         return
@@ -1830,7 +2079,6 @@ async def game_joker(message: types.Message):
         return
 
     game_key = (message.chat.id, message.from_user.id)
-
     if game_key in active_joker_games:
         await message.reply("❌ У вас уже есть активная игра в Джокер! Напишите `/стоп` для отмены.")
         return
@@ -2185,6 +2433,7 @@ LVL_BASE_PRICE = 25000.0
 
 async def get_or_create_farm(user_id: int):
     now = int(time.time())
+
     await bot_db.execute(
         "INSERT OR IGNORE INTO mining_farms (user_id, level, gpu_count, last_collect) VALUES (?, 1, 1, ?)",
         (user_id, now)
@@ -2198,7 +2447,6 @@ async def get_or_create_farm(user_id: int):
 def calculate_farm_income(level: int, gpu_count: int, last_collect: int, broken: bool = False):
     now = int(time.time())
     elapsed_seconds = max(0, now - last_collect)
-
     income_per_hour = level * gpu_count * 350.0
 
     if broken:
@@ -2254,7 +2502,6 @@ async def show_mining_farm(message: types.Message):
     farm = await get_or_create_farm(user['tg_id'])
 
     is_broken = bool(farm['broken'])
-
     income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'], is_broken)
 
     gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
@@ -2523,7 +2770,6 @@ async def callback_farm_refresh(callback: types.CallbackQuery):
     farm = await get_or_create_farm(owner_id)
 
     is_broken = bool(farm['broken'])
-
     income_per_hour, uncollected = calculate_farm_income(farm['level'], farm['gpu_count'], farm['last_collect'], is_broken)
 
     gpu_cost = GPU_BASE_PRICE * (1.35 ** (farm['gpu_count'] - 1))
@@ -2568,7 +2814,6 @@ async def game_crash(message: types.Message):
         return
 
     auto_cashout = None
-
     if len(parts) >= 3:
         try:
             val = float(parts[2].replace(",", "."))
@@ -2578,7 +2823,6 @@ async def game_crash(message: types.Message):
             pass
 
     game_key = (message.chat.id, message.from_user.id)
-
     if game_key in active_crash_games:
         await message.reply("❌ У вас уже есть запущенная игра в Краш! Напишите `/стоп` для отмены.")
         return
@@ -2641,7 +2885,6 @@ async def run_crash_flight(chat_id: int, user_id: int, crash_id: str, msg: types
 
             increment = round(random.uniform(0.05, 0.15) if current_mult < 2.0 else random.uniform(0.15, 0.40), 2)
             current_mult = round(current_mult + increment, 2)
-
             game['current_multiplier'] = current_mult
 
             display_name = f"@{game['username']}" if game['username'] and game['username'] != "Неизвестно" else "Игрок"
@@ -2789,7 +3032,6 @@ async def roulette_show_bets(message: types.Message):
         return
 
     text = "🎰 *Ваши ставки в текущем раунде:*\n"
-
     for idx, b in enumerate(bets, 1):
         text += f"{idx}. `{b['bet']:,.2f}` монет на {b['type']}\n"
 
@@ -2808,7 +3050,6 @@ async def roulette_double(message: types.Message):
         return
 
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-
     add_req = sum(b['bet'] for b in bets)
 
     if not check_balance(user['tg_id'], user['balance'], add_req):
@@ -2836,7 +3077,6 @@ async def roulette_repeat(message: types.Message):
         return
 
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-
     req = sum(b['bet'] for b in last)
 
     if not check_balance(user['tg_id'], user['balance'], req):
@@ -2888,7 +3128,6 @@ async def roulette_place_bet(message: types.Message):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
 
     bet_str, bet_type = parts[0], parts[1]
-
     bet = parse_amount(bet_str, user['balance'])
 
     if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
@@ -2923,7 +3162,6 @@ async def roulette_spin(message: types.Message):
         return
 
     num = secrets.randbelow(37)
-
     color = "🟢 Зеро" if num == 0 else ("🔴 Красное" if num in RED_NUMBERS else "⚫ Черное")
 
     total_win = 0.0
@@ -2955,6 +3193,7 @@ async def roulette_spin(message: types.Message):
     import copy
     last_roulette_bets[key] = copy.deepcopy(bets)
     active_roulette_bets[key] = []
+
     await _remove_game("roulette", f"{message.chat.id}:{message.from_user.id}")
 
     if total_win > 0:
@@ -3009,7 +3248,6 @@ async def start_dice_pve(message: types.Message, parts: list):
         return
 
     game_key = (message.chat.id, user['tg_id'])
-
     if game_key in active_dice_games:
         await message.reply("❌ У вас уже есть активная игра в кости! Напишите `/стоп` для отмены.")
         return
@@ -3239,7 +3477,9 @@ async def callback_dice_pvp_accept(callback: types.CallbackQuery):
         await callback.answer("❌ У вас недостаточно монет для принятия дуэли!", show_alert=True)
         return
 
-    d["timer_task"].cancel()
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
+
     del pending_dice_pvp[dice_id]
     await _remove_game("dicepvp_pending", dice_id)
 
@@ -3303,9 +3543,12 @@ async def callback_dice_pvp_decline(callback: types.CallbackQuery):
         await callback.answer("❌ Отклонить вызов может только вызванный игрок!", show_alert=True)
         return
 
-    d["timer_task"].cancel()
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
+
     del pending_dice_pvp[dice_id]
     await _remove_game("dicepvp_pending", dice_id)
+
     await update_balance(d["challenger_id"], d["bet"])
 
     await callback.message.edit_text(f"⛔ {d['target_name']} отклонил(а) дуэль в кости. Ставка возвращена.")
@@ -3360,7 +3603,8 @@ async def callback_dice_pvp_roll(callback: types.CallbackQuery):
         return
 
     # Оба бросили — определяем победителя
-    d["timer_task"].cancel()
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
 
     r1, r2 = d["rolls"]["p1"], d["rolls"]["p2"]
     s1, s2 = sum(r1), sum(r2)
@@ -3431,7 +3675,6 @@ async def game_coin(message: types.Message):
         return
 
     game_key = (message.chat.id, user['tg_id'])
-
     if game_key in active_coin_games:
         await message.reply("❌ У вас уже есть активная игра в монетку! Напишите `/стоп` для отмены.")
         return
@@ -3501,7 +3744,6 @@ async def callback_coin_pick(callback: types.CallbackQuery):
         pass
 
     await callback.answer()
-
     await asyncio.sleep(1.0)
 
     choice_name = "🦅 ОРЁЛ" if choice == "heads" else "🪙 РЕШКА"
@@ -3632,7 +3874,6 @@ async def game_blackjack(message: types.Message):
         return
 
     game_key = (message.chat.id, user['tg_id'])
-
     if game_key in active_blackjack_games:
         await message.reply("❌ У вас уже есть активная игра в блэкджек! Напишите `/стоп` для отмены.")
         return
@@ -3696,7 +3937,6 @@ async def do_bj_stand(callback: types.CallbackQuery, game: dict, game_key: tuple
         game["dealer"].append(game["deck"].pop())
 
     pv, dv = bj_value(game["player"]), bj_value(game["dealer"])
-
     bet = game["bet"]
     owner_id = game["user_id"]
 
@@ -3845,17 +4085,14 @@ def ttt_bot_move(board: list, bot_sym: str) -> int:
 
     def _score(b: list, depth: int) -> int:
         winner = ttt_check(b)
-
         if winner == bot_sym:
             return 10 - depth
         if winner == human_sym:
             return -10 + depth
-
         return 0
 
     def _minimax(b: list, depth: int, is_maximizing: bool, alpha: int, beta: int) -> int:
         score = _score(b, depth)
-
         if score != 0:
             return score
 
@@ -3864,31 +4101,25 @@ def ttt_bot_move(board: list, bot_sym: str) -> int:
 
         if is_maximizing:
             best = -1000
-
             for i, v in enumerate(b):
                 if not v:
                     b[i] = bot_sym
                     best = max(best, _minimax(b, depth + 1, False, alpha, beta))
                     b[i] = ""
-
                     alpha = max(alpha, best)
                     if beta <= alpha:
                         break
-
             return best
         else:
             best = 1000
-
             for i, v in enumerate(b):
                 if not v:
                     b[i] = human_sym
                     best = min(best, _minimax(b, depth + 1, True, alpha, beta))
                     b[i] = ""
-
                     beta = min(beta, best)
                     if beta <= alpha:
                         break
-
             return best
 
     best_score = -1000
@@ -4101,7 +4332,9 @@ async def callback_ttt_accept(callback: types.CallbackQuery):
         await callback.answer("❌ У вас недостаточно монет!", show_alert=True)
         return
 
-    t["timer_task"].cancel()
+    if t.get("timer_task"):
+        t["timer_task"].cancel()
+
     del pending_ttt[ttt_id]
     await _remove_game("ttt_pending", ttt_id)
 
@@ -4153,9 +4386,12 @@ async def callback_ttt_decline(callback: types.CallbackQuery):
         await callback.answer("❌ Отклонить вызов может только вызванный игрок!", show_alert=True)
         return
 
-    t["timer_task"].cancel()
+    if t.get("timer_task"):
+        t["timer_task"].cancel()
+
     del pending_ttt[ttt_id]
     await _remove_game("ttt_pending", ttt_id)
+
     await update_balance(t["challenger_id"], t["bet"])
 
     await callback.message.edit_text(f"⛔ {t['target_name']} отклонил(а) игру. Ставка возвращена.")
@@ -4180,11 +4416,9 @@ async def finish_ttt(ttt_id: str, game: dict, result: str, msg):
             win = round(bet * EVEN_PAYOUT, 2)
             await update_balance(game["x_id"], win)
             await add_history(game["x_id"], "Крестики-нолики (Победа)", win - bet)
-
             text = f"🏆 *ВЫ ПОБЕДИЛИ БОТА!* Выигрыш: {win:,.2f} GHRAM"
         else:
             await add_history(game["x_id"], "Крестики-нолики (Поражение)", -bet)
-
             text = f"🤖 *БОТ ПОБЕДИЛ!* Ставка `{bet:,.2f}` сгорела."
 
     else:
@@ -4218,7 +4452,6 @@ async def ttt_bot_turn(ttt_id: str):
     await asyncio.sleep(0.7)
 
     game = active_ttt_games.get(ttt_id)
-
     if not game or not game["vs_bot"]:
         return
 
@@ -4226,7 +4459,6 @@ async def ttt_bot_turn(ttt_id: str):
     game["board"][idx] = "⭕"
 
     winner = ttt_check(game["board"])
-
     if winner:
         await finish_ttt(ttt_id, game, winner, game["msg"])
         return
@@ -4281,7 +4513,6 @@ async def callback_ttt_move(callback: types.CallbackQuery):
     game["board"][idx] = sym
 
     winner = ttt_check(game["board"])
-
     if winner:
         await finish_ttt(ttt_id, game, winner, callback.message)
         await callback.answer("Игра окончена!")
@@ -4347,7 +4578,6 @@ SLOT_CHERRY2_CHANCE = 0.10
 
 def slots_spin_result() -> tuple:
     sys_rand = secrets.SystemRandom()
-
     r = sys_rand.random()
     acc = 0.0
 
@@ -4370,13 +4600,10 @@ def slots_spin_result() -> tuple:
 
     while True:
         reels = sys_rand.choices(symbols, weights=weights, k=3)
-
         if reels[0] == reels[1] == reels[2]:
             continue
-
         if reels.count("🍒") == 2:
             continue
-
         return reels, 0.0
 
 
@@ -4408,7 +4635,6 @@ async def game_slots(message: types.Message):
         return
 
     game_key = (message.chat.id, user['tg_id'])
-
     if game_key in active_slots_spins:
         await message.reply("❌ Дождитесь окончания текущего вращения!")
         return
@@ -4423,7 +4649,6 @@ async def game_slots(message: types.Message):
     )
 
     msg = await message.reply(text, parse_mode="Markdown")
-
     asyncio.create_task(run_slots_spin(msg, message.chat.id, user['tg_id'], bet))
 
 
@@ -4432,14 +4657,12 @@ async def run_slots_spin(msg: types.Message, chat_id: int, user_id: int, bet: fl
     active_slots_spins.add(game_key)
 
     sys_rand = secrets.SystemRandom()
-
     symbols = list(SLOT_WEIGHTS.keys())
     weights = [SLOT_WEIGHTS[s] for s in symbols]
 
     try:
         for _ in range(4):
             frame = " | ".join(sys_rand.choices(symbols, weights=weights, k=3))
-
             try:
                 await msg.edit_text(
                     f"🎰 *СЛОТ-МАШИНА «GHRAM JACKPOT»*\n"
@@ -4449,7 +4672,6 @@ async def run_slots_spin(msg: types.Message, chat_id: int, user_id: int, bet: fl
                 )
             except Exception:
                 pass
-
             await asyncio.sleep(0.5)
 
         reels, payout = slots_spin_result()
@@ -4484,7 +4706,6 @@ async def run_slots_spin(msg: types.Message, chat_id: int, user_id: int, bet: fl
 
     except Exception as e:
         logging.error(f"Error in slots spin: {e}")
-
     finally:
         active_slots_spins.discard(game_key)
 
@@ -4506,13 +4727,11 @@ async def callback_slots_spin(callback: types.CallbackQuery):
         return
 
     game_key = (callback.message.chat.id, owner_id)
-
     if game_key in active_slots_spins:
         await callback.answer("❌ Дождитесь окончания вращения!", show_alert=True)
         return
 
     await update_balance(user['tg_id'], -bet)
-
     await callback.answer("🎰 Крутим!")
 
     asyncio.create_task(run_slots_spin(callback.message, callback.message.chat.id, owner_id, bet))
@@ -4541,12 +4760,10 @@ async def get_member_row(user_id: int):
 
 async def get_user_clan_full(user_id: int):
     m = await get_member_row(user_id)
-
     if not m:
         return None, None
 
     clan = await get_clan_by_id(m['clan_id'])
-
     if not clan:
         return None, None
 
@@ -4639,7 +4856,6 @@ async def clan_show_menu(message: types.Message):
         return
 
     count = await get_clan_member_count(clan['id'])
-
     owner_row = await get_or_create_user(clan['owner_id'])
     owner_name = display_name_of(owner_row['username']) if owner_row else f"ID {clan['owner_id']}"
 
@@ -4658,7 +4874,6 @@ async def clan_show_menu(message: types.Message):
 
 async def clan_create(message: types.Message, parts: list):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-
     clan, _ = await get_user_clan_full(user['tg_id'])
 
     if clan:
@@ -4701,7 +4916,6 @@ async def clan_create(message: types.Message, parts: list):
         "INSERT INTO clan_members (user_id, clan_id, role, joined_at) VALUES (?, ?, 'owner', ?)",
         (user['tg_id'], clan_id, now)
     )
-
     await bot_db.commit()
 
     await add_history(user['tg_id'], f"Создание клана «{name}»", -CLAN_CREATE_COST)
@@ -4721,7 +4935,6 @@ async def clan_create(message: types.Message, parts: list):
 
 async def clan_invite(message: types.Message, parts: list):
     inviter = await get_or_create_user(message.from_user.id, message.from_user.username)
-
     clan, member = await get_user_clan_full(inviter['tg_id'])
 
     if not clan:
@@ -4738,7 +4951,6 @@ async def clan_invite(message: types.Message, parts: list):
         target_user = await get_or_create_user(message.reply_to_message.from_user.id, message.reply_to_message.from_user.username)
     elif len(parts) >= 3:
         target_user = await get_user_by_identifier(parts[2])
-
         if not target_user:
             await message.reply("❌ Пользователь не найден в базе данных бота!")
             return
@@ -4751,7 +4963,6 @@ async def clan_invite(message: types.Message, parts: list):
         return
 
     t_clan, _ = await get_user_clan_full(target_user['tg_id'])
-
     if t_clan:
         await message.reply(f"❌ Этот игрок уже состоит в клане «{t_clan['name']}»!")
         return
@@ -4772,7 +4983,6 @@ async def clan_invite(message: types.Message, parts: list):
         "INSERT INTO clan_invites (invite_id, clan_id, inviter_id, target_id, created_at) VALUES (?, ?, ?, ?, ?)",
         (invite_id, clan['id'], inviter['tg_id'], target_user['tg_id'], now)
     )
-
     await bot_db.commit()
 
     target_name = display_name_of(target_user['username'])
@@ -4814,7 +5024,6 @@ async def callback_clan_accept(callback: types.CallbackQuery):
         return
 
     clan = await get_clan_by_id(inv['clan_id'])
-
     if not clan:
         await bot_db.execute("DELETE FROM clan_invites WHERE invite_id = ?", (invite_id,))
         await bot_db.commit()
@@ -4822,13 +5031,11 @@ async def callback_clan_accept(callback: types.CallbackQuery):
         return
 
     existing = await get_member_row(callback.from_user.id)
-
     if existing:
         await callback.answer("❌ Вы уже состоите в клане!", show_alert=True)
         return
 
     count = await get_clan_member_count(clan['id'])
-
     if count >= clan_member_limit(clan['level']):
         await callback.answer("❌ Клан заполнен!", show_alert=True)
         return
@@ -4839,7 +5046,6 @@ async def callback_clan_accept(callback: types.CallbackQuery):
         "INSERT INTO clan_members (user_id, clan_id, role, joined_at) VALUES (?, ?, 'member', ?)",
         (callback.from_user.id, clan['id'], int(time.time()))
     )
-
     await bot_db.execute("DELETE FROM clan_invites WHERE invite_id = ?", (invite_id,))
     await bot_db.commit()
 
@@ -4847,7 +5053,6 @@ async def callback_clan_accept(callback: types.CallbackQuery):
         f"✅ {display_name_of(callback.from_user.username)} вступил(а) в клан *⚔️ «{clan['name']}»*!",
         parse_mode="Markdown"
     )
-
     await callback.answer(f"🎉 Добро пожаловать в «{clan['name']}»!")
 
 
@@ -4876,7 +5081,6 @@ async def callback_clan_decline(callback: types.CallbackQuery):
     await callback.message.edit_text(
         f"⛔ {display_name_of(callback.from_user.username)} отклонил(а) приглашение в клан «{clan_name}»."
     )
-
     await callback.answer("Приглашение отклонено")
 
 
@@ -4903,7 +5107,6 @@ async def clan_leave_cmd(message: types.Message):
 @dp.callback_query(F.data.startswith("clan_leave:"))
 async def callback_clan_leave(callback: types.CallbackQuery):
     clan_id = int(callback.data.split(":")[1])
-
     clan = await get_clan_by_id(clan_id)
 
     if not clan:
@@ -4954,7 +5157,6 @@ async def clan_disband_cmd(message: types.Message):
 @dp.callback_query(F.data.startswith("clan_disb:"))
 async def callback_clan_disband(callback: types.CallbackQuery):
     clan_id = int(callback.data.split(":")[1])
-
     clan = await get_clan_by_id(clan_id)
 
     if not clan:
@@ -4980,7 +5182,6 @@ async def callback_clan_disband(callback: types.CallbackQuery):
         f"☠️ Клан «{clan['name']}» расформирован. Казна `{refund:,.2f}` GHRAM возвращена главарю.",
         parse_mode="Markdown"
     )
-
     await callback.answer("Клан расформирован")
 
 
@@ -4992,7 +5193,6 @@ async def callback_clan_disband_cancel(callback: types.CallbackQuery):
 
 async def clan_donate(message: types.Message, parts: list):
     user = await get_or_create_user(message.from_user.id, message.from_user.username)
-
     clan, _ = await get_user_clan_full(user['tg_id'])
 
     if not clan:
@@ -5004,7 +5204,6 @@ async def clan_donate(message: types.Message, parts: list):
         return
 
     amount = parse_amount(parts[2], user['balance'])
-
     if not amount or amount <= 0:
         await message.reply("❌ Укажите корректную сумму!")
         return
@@ -5019,7 +5218,6 @@ async def clan_donate(message: types.Message, parts: list):
         "UPDATE clans SET balance = balance + ?, total_donated = total_donated + ? WHERE id = ?",
         (amount, amount, clan['id'])
     )
-
     await bot_db.commit()
 
     await add_history(user['tg_id'], f"Взнос в клан «{clan['name']}»", -amount)
@@ -5052,7 +5250,6 @@ async def clan_kick(message: types.Message, parts: list):
         return
 
     target = await resolve_clan_target(message, parts, 3)
-
     if not target:
         await message.reply("❌ Использование: `клан кик [@username/ID]` или ответьте на сообщение игрока.", parse_mode="Markdown")
         return
@@ -5089,7 +5286,6 @@ async def clan_set_role(message: types.Message, parts: list, new_role: str):
         return
 
     target = await resolve_clan_target(message, parts, 3)
-
     if not target:
         verb = "повысить" if new_role == "elder" else "понизить"
         await message.reply(f"❌ Использование: `клан {verb} [@username/ID]` или ответьте на сообщение игрока.", parse_mode="Markdown")
@@ -5127,7 +5323,6 @@ async def clan_transfer_owner(message: types.Message, parts: list):
         return
 
     target = await resolve_clan_target(message, parts, 3)
-
     if not target:
         await message.reply("❌ Использование: `клан передать [@username/ID]` или ответьте на сообщение игрока.", parse_mode="Markdown")
         return
@@ -5186,7 +5381,6 @@ async def clan_upgrade_cmd(message: types.Message):
 @dp.callback_query(F.data.startswith("clan_up:"))
 async def callback_clan_upgrade(callback: types.CallbackQuery):
     clan_id = int(callback.data.split(":")[1])
-
     clan = await get_clan_by_id(clan_id)
 
     if not clan:
@@ -5225,7 +5419,6 @@ async def clan_top(message: types.Message):
 @dp.callback_query(F.data.startswith("clan_members:"))
 async def callback_clan_members(callback: types.CallbackQuery):
     clan_id = int(callback.data.split(":")[1])
-
     clan = await get_clan_by_id(clan_id)
 
     if not clan:
@@ -5251,7 +5444,6 @@ async def callback_clan_members(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("clan_treasury:"))
 async def callback_clan_treasury(callback: types.CallbackQuery):
     clan_id = int(callback.data.split(":")[1])
-
     clan = await get_clan_by_id(clan_id)
 
     if not clan:
@@ -5288,6 +5480,681 @@ async def callback_clan_create_help(callback: types.CallbackQuery):
         f"✍️ Введите команду: клан создать [название]\n💵 Стоимость: {CLAN_CREATE_COST:,.0f} GHRAM",
         show_alert=True
     )
+
+
+# ----------------------------------------------------
+# 15. ФУТБОЛ И БАСКЕТБОЛ ⚽🏀
+# ----------------------------------------------------
+SPORT_META = {
+    "fb": {
+        "emoji": "⚽",
+        "name": "ФУТБОЛ",
+        "action": "УДАР",
+        "cmd": "футбол",
+        "dice": "⚽"
+    },
+    "bb": {
+        "emoji": "🏀",
+        "name": "БАСКЕТБОЛ",
+        "action": "БРОСОК",
+        "cmd": "баскетбол",
+        "dice": "🏀"
+    }
+}
+
+SPORT_MAX_ROUNDS = 3
+SPORT_TIMEOUT = 180
+
+
+def sport_pve_key(sport: str, chat_id: int, user_id: int) -> str:
+    return f"{sport}:{chat_id}:{user_id}"
+
+
+async def send_sport_dice(chat_id: int, emoji: str) -> int:
+    """
+    Отправляет анимированный dice-эмодзи Telegram и возвращает его значение.
+    Если Telegram по какой-то причине не дал значение — используем честный рандом.
+    """
+    try:
+        dice_msg = await bot.send_dice(chat_id, emoji=emoji)
+        if dice_msg and dice_msg.dice and isinstance(dice_msg.dice.value, int):
+            return dice_msg.dice.value
+    except Exception as e:
+        logging.error(f"Failed to send animated dice {emoji}: {e}")
+
+    return secrets.SystemRandom().randint(1, 5)
+
+
+def build_sport_disabled_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅", callback_data="sp_dis")]
+    ])
+
+
+def build_sport_pve_keyboard(sport: str, user_id: int, round_no: int, max_rounds: int) -> InlineKeyboardMarkup:
+    meta = SPORT_META[sport]
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{meta['emoji']} {meta['action']} {round_no}/{max_rounds}", callback_data=f"sp_pve:{sport}:{user_id}")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data=f"sp_pvec:{sport}:{user_id}")]
+    ])
+
+
+def build_sport_pending_keyboard(sport: str, match_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Согласиться ✅", callback_data=f"sp_acc:{sport}:{match_id}"),
+            InlineKeyboardButton(text="Отказаться ⛔", callback_data=f"sp_dec:{sport}:{match_id}")
+        ]
+    ])
+
+
+def build_sport_active_keyboard(sport: str, match_id: str) -> InlineKeyboardMarkup:
+    meta = SPORT_META[sport]
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{meta['emoji']} {meta['action']}", callback_data=f"sp_roll:{sport}:{match_id}")]
+    ])
+
+
+def render_sport_pve(game: dict, extra: str = "") -> str:
+    meta = SPORT_META[game["sport"]]
+    user_link = safe_user_link_html(game["user_id"], game["username"])
+    round_show = min(game["round"], game["max_rounds"])
+
+    text = (
+        f"{meta['emoji']} <b>{meta['name']} — МАТЧ С БОТОМ</b>\n\n"
+        f"👤 Игрок: {user_link}\n"
+        f"🤖 Соперник: 🤖 Бот\n"
+        f"💰 Ставка: <code>{format_balance_safe(game['bet'], game['user_id'])}</code> GHRAM\n"
+        f"📊 Счёт: <b>{game['user_score']} : {game['bot_score']}</b>\n"
+        f"🔢 Раунд: {round_show}/{game['max_rounds']}"
+    )
+
+    if extra:
+        text += f"\n\n{extra}"
+
+    return text
+
+
+def render_sport_pvp(d: dict, extra: str = "") -> str:
+    meta = SPORT_META[d["sport"]]
+    round_show = min(d["round"], d["max_rounds"])
+
+    text = (
+        f"{meta['emoji']} <b>{meta['name']} — ДУЭЛЬ</b>\n\n"
+        f"👤 {d['p1_html']} — против — {d['p2_html']}\n"
+        f"💰 Банк: <code>{format_balance_safe(d['bet'] * 2, 0)}</code> GHRAM\n"
+        f"📊 Счёт: <b>{d['p1_score']} : {d['p2_score']}</b>\n"
+        f"🔢 Раунд: {round_show}/{d['max_rounds']}"
+    )
+
+    if extra:
+        text += f"\n\n{extra}"
+
+    return text
+
+
+async def settle_sport_pve(game_key: str, game: dict, msg: types.Message, extra: str = "") -> str:
+    meta = SPORT_META[game["sport"]]
+    bet = game["bet"]
+    uid = game["user_id"]
+    user_link = safe_user_link_html(uid, game["username"])
+
+    if game["user_score"] > game["bot_score"]:
+        win = round(bet * EVEN_PAYOUT, 2)
+        await update_balance(uid, win)
+        await add_history(uid, f"{meta['name']} (Победа)", win - bet)
+
+        result = f"🏆 <b>ПОБЕДА!</b> {user_link} забирает <b>{format_balance_safe(win, uid)}</b> GHRAM"
+        alert = f"🏆 Победа! +{format_balance_safe(win, uid)} GHRAM"
+
+    elif game["user_score"] < game["bot_score"]:
+        await add_history(uid, f"{meta['name']} (Поражение)", -bet)
+
+        result = f"🤖 <b>БОТ ПОБЕДИЛ!</b> Ставка <code>{format_balance_safe(bet, uid)}</code> GHRAM сгорела."
+        alert = "🤖 Бот победил!"
+
+    else:
+        await update_balance(uid, bet)
+        await add_history(uid, f"{meta['name']} (Ничья)", 0)
+
+        result = "🤝 <b>НИЧЬЯ!</b> Ставка возвращена."
+        alert = "🤝 Ничья"
+
+    active_sport_pve_games.pop(game_key, None)
+    await _remove_game("sport_pve", game_key)
+
+    final_extra = f"{extra}\n\n{result}" if extra else result
+    text = render_sport_pve(game, final_extra)
+
+    try:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=build_sport_disabled_keyboard())
+    except Exception:
+        pass
+
+    return alert
+
+
+async def settle_sport_pvp(match_id: str, d: dict, msg: types.Message, extra: str = "") -> str:
+    meta = SPORT_META[d["sport"]]
+    bet = d["bet"]
+    pot = bet * 2
+    win = round(pot * (1 - PVP_RAKE), 2)
+
+    if d["p1_score"] > d["p2_score"]:
+        winner_id = d["p1_id"]
+        winner_html = d["p1_html"]
+        loser_id = d["p2_id"]
+
+        await update_balance(winner_id, win)
+        await add_history(winner_id, f"{meta['name']} PvP (Победа)", win - bet)
+        await add_history(loser_id, f"{meta['name']} PvP (Поражение)", -bet)
+
+        result = f"👑 <b>ПОБЕЖДАЕТ {winner_html}!</b>\n💰 Выигрыш: <b>{format_balance_safe(win, winner_id)}</b> GHRAM"
+        alert = "👑 Победа!"
+
+    elif d["p2_score"] > d["p1_score"]:
+        winner_id = d["p2_id"]
+        winner_html = d["p2_html"]
+        loser_id = d["p1_id"]
+
+        await update_balance(winner_id, win)
+        await add_history(winner_id, f"{meta['name']} PvP (Победа)", win - bet)
+        await add_history(loser_id, f"{meta['name']} PvP (Поражение)", -bet)
+
+        result = f"👑 <b>ПОБЕЖДАЕТ {winner_html}!</b>\n💰 Выигрыш: <b>{format_balance_safe(win, winner_id)}</b> GHRAM"
+        alert = "👑 Победа!"
+
+    else:
+        await update_balance(d["p1_id"], bet)
+        await update_balance(d["p2_id"], bet)
+        await add_history(d["p1_id"], f"{meta['name']} PvP (Ничья)", 0)
+        await add_history(d["p2_id"], f"{meta['name']} PvP (Ничья)", 0)
+
+        result = "🤝 <b>НИЧЬЯ!</b> Ставки возвращены обоим игрокам."
+        alert = "🤝 Ничья"
+
+    active_sport_pvp.pop(match_id, None)
+    await _remove_game("sport_pvp_active", match_id)
+
+    final_extra = f"{extra}\n\n{result}" if extra else result
+    text = render_sport_pvp(d, final_extra)
+
+    try:
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=build_sport_disabled_keyboard())
+    except Exception:
+        pass
+
+    return alert
+
+
+async def sport_pvp_invite_timeout(match_id: str):
+    await asyncio.sleep(SPORT_TIMEOUT)
+
+    d = pending_sport_pvp.pop(match_id, None)
+    if d:
+        await update_balance(d["challenger_id"], d["bet"])
+        await _remove_game("sport_pvp_pending", match_id)
+
+        try:
+            await d["msg"].edit_text("⏳ Время ожидания истекло (3 мин). Матч отменён, ставка возвращена.")
+        except Exception:
+            pass
+
+
+async def sport_pvp_round_timeout(match_id: str):
+    await asyncio.sleep(SPORT_TIMEOUT)
+
+    if match_id in active_sport_pvp:
+        d = active_sport_pvp.pop(match_id, None)
+        if d:
+            await update_balance(d["p1_id"], d["bet"])
+            await update_balance(d["p2_id"], d["bet"])
+            await _remove_game("sport_pvp_active", match_id)
+
+            try:
+                await d["msg"].edit_text("⏳ Время ожидания истекло (3 мин). Матч отменён, ставки возвращены.")
+            except Exception:
+                pass
+
+
+async def start_sport_pve(message: types.Message, parts: list, sport: str):
+    user = await get_or_create_user(message.from_user.id, message.from_user.username)
+    meta = SPORT_META[sport]
+
+    if len(parts) < 2:
+        await message.reply(
+            f"{meta['emoji']} <b>{meta['name']}</b>\n"
+            f"Использование:\n"
+            f"• <code>{meta['cmd']} [сумма]</code> — игра против бота\n"
+            f"• <code>{meta['cmd']} пвп [@username/ID] [сумма]</code> — дуэль с игроком",
+            parse_mode="HTML"
+        )
+        return
+
+    bet = parse_amount(parts[1], user['balance'])
+    if not bet or bet <= 0 or not check_balance(user['tg_id'], user['balance'], bet):
+        await message.reply("❌ Недостаточно средств или неверная сумма!")
+        return
+
+    game_key = sport_pve_key(sport, message.chat.id, user['tg_id'])
+
+    if game_key in active_sport_pve_games:
+        await message.reply("❌ У вас уже есть активный матч! Напишите /стоп для отмены.")
+        return
+
+    await update_balance(user['tg_id'], -bet)
+
+    game = {
+        "sport": sport,
+        "chat_id": message.chat.id,
+        "user_id": user['tg_id'],
+        "username": user['username'] or "Игрок",
+        "bet": bet,
+        "round": 1,
+        "max_rounds": SPORT_MAX_ROUNDS,
+        "user_score": 0,
+        "bot_score": 0,
+        "status": "playing"
+    }
+
+    active_sport_pve_games[game_key] = game
+    await _save_game("sport_pve", game_key, message.chat.id, user['tg_id'], bet)
+
+    text = render_sport_pve(game, f"Нажмите кнопку ниже, чтобы сделать {meta['action'].lower()}!")
+
+    await message.reply(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_sport_pve_keyboard(sport, user['tg_id'], 1, SPORT_MAX_ROUNDS)
+    )
+
+
+async def start_sport_pvp(message: types.Message, parts: list, sport: str):
+    sender = await get_or_create_user(message.from_user.id, message.from_user.username)
+    meta = SPORT_META[sport]
+
+    target_user = None
+    bet = None
+
+    if message.reply_to_message:
+        if len(parts) >= 3:
+            bet = parse_amount(parts[2], sender['balance'])
+            target_user = await get_or_create_user(message.reply_to_message.from_user.id, message.reply_to_message.from_user.username)
+        else:
+            await message.reply(
+                f"{meta['emoji']} Использование: <code>{meta['cmd']} пвп [сумма]</code> в ответ на сообщение игрока.",
+                parse_mode="HTML"
+            )
+            return
+
+    elif len(parts) >= 4:
+        target_user = await get_user_by_identifier(parts[2])
+        bet = parse_amount(parts[3], sender['balance'])
+
+        if not target_user:
+            await message.reply("❌ Пользователь не найден в базе данных бота!")
+            return
+    else:
+        await message.reply(
+            f"{meta['emoji']} <b>{meta['name']} — PvP</b>\n"
+            f"Использование:\n"
+            f"• <code>{meta['cmd']} пвп [@username/ID] [сумма]</code>\n"
+            f"• Или ответьте на сообщение: <code>{meta['cmd']} пвп [сумма]</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if not bet or bet <= 0:
+        await message.reply("❌ Ставка должна быть больше 0.")
+        return
+
+    if target_user['tg_id'] == sender['tg_id']:
+        await message.reply("❌ Нельзя вызывать на дуэль самого себя!")
+        return
+
+    if not check_balance(sender['tg_id'], sender['balance'], bet):
+        await message.reply(f"❌ У вас недостаточно монет (нужно {bet:,.2f}).")
+        return
+
+    if not check_balance(target_user['tg_id'], target_user['balance'], bet):
+        await message.reply(f"❌ У соперника недостаточно монет (нужно {bet:,.2f}).")
+        return
+
+    for d in list(pending_sport_pvp.values()) + list(active_sport_pvp.values()):
+        ids = {d.get('challenger_id'), d.get('target_id'), d.get('p1_id'), d.get('p2_id')}
+        if sender['tg_id'] in ids or target_user['tg_id'] in ids:
+            await message.reply(f"❌ Один из участников уже находится в активной игре {meta['name']}!")
+            return
+
+    await update_balance(sender['tg_id'], -bet)
+
+    match_id = secrets.token_hex(4)
+
+    challenger_html = safe_user_link_html(sender['tg_id'], sender['username'])
+    target_html = safe_user_link_html(target_user['tg_id'], target_user['username'])
+
+    kb = build_sport_pending_keyboard(sport, match_id)
+
+    sent_msg = await message.answer(
+        f"{meta['emoji']} {target_html}, вас вызывают на дуэль в {meta['name'].lower()}!\n"
+        f"👤 Инициатор: {challenger_html}\n"
+        f"💰 Ставка: <b>{format_balance_safe(bet, sender['tg_id'])}</b> GHRAM "
+        f"(банк <b>{format_balance_safe(bet * 2, 0)}</b>)\n"
+        f"🏆 Победитель забирает банк за вычетом комиссии бота {PVP_RAKE * 100:.1f}%",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+    await _save_game("sport_pvp_pending", match_id, message.chat.id, sender['tg_id'], bet)
+
+    timer_task = asyncio.create_task(sport_pvp_invite_timeout(match_id))
+
+    pending_sport_pvp[match_id] = {
+        "sport": sport,
+        "chat_id": message.chat.id,
+        "challenger_id": sender['tg_id'],
+        "challenger_html": challenger_html,
+        "target_id": target_user['tg_id'],
+        "target_html": target_html,
+        "bet": bet,
+        "msg": sent_msg,
+        "timer_task": timer_task
+    }
+
+
+@dp.message(F.text.lower().startswith(("футбол", "/футбол", "football", "/football")))
+async def game_football_entry(message: types.Message):
+    parts = message.text.split()
+
+    if len(parts) >= 2 and parts[1].lower() in ("пвп", "pvp"):
+        await start_sport_pvp(message, parts, "fb")
+    else:
+        await start_sport_pve(message, parts, "fb")
+
+
+@dp.message(F.text.lower().startswith(("баскетбол", "/баскетбол", "basketball", "/basketball")))
+async def game_basketball_entry(message: types.Message):
+    parts = message.text.split()
+
+    if len(parts) >= 2 and parts[1].lower() in ("пвп", "pvp"):
+        await start_sport_pvp(message, parts, "bb")
+    else:
+        await start_sport_pve(message, parts, "bb")
+
+
+@dp.callback_query(F.data.startswith("sp_pve:"))
+async def callback_sport_pve_roll(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    sport = parts[1]
+    owner_id = int(parts[2])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = sport_pve_key(sport, callback.message.chat.id, owner_id)
+    game = active_sport_pve_games.get(game_key)
+
+    if not game or game.get("status") != "playing":
+        await callback.answer("Эта игра уже завершена!", show_alert=True)
+        return
+
+    meta = SPORT_META[sport]
+
+    await callback.answer()
+
+    user_roll = await send_sport_dice(callback.message.chat.id, meta["dice"])
+    bot_roll = await send_sport_dice(callback.message.chat.id, meta["dice"])
+
+    if user_roll > bot_roll:
+        game["user_score"] += 1
+        extra = f"✅ Раунд {game['round']}: <b>{user_roll}</b> — <b>{bot_roll}</b>\nВы выиграли раунд!"
+    elif user_roll < bot_roll:
+        game["bot_score"] += 1
+        extra = f"❌ Раунд {game['round']}: <b>{user_roll}</b> — <b>{bot_roll}</b>\nБот выиграл раунд!"
+    else:
+        extra = f"🤝 Раунд {game['round']}: <b>{user_roll}</b> — <b>{bot_roll}</b>\nНичья в раунде!"
+
+    game["round"] += 1
+
+    if game["round"] > game["max_rounds"]:
+        alert = await settle_sport_pve(game_key, game, callback.message, extra)
+        await callback.answer(alert)
+        return
+
+    try:
+        await callback.message.edit_text(
+            render_sport_pve(game, extra),
+            parse_mode="HTML",
+            reply_markup=build_sport_pve_keyboard(sport, owner_id, game["round"], game["max_rounds"])
+        )
+    except Exception:
+        pass
+
+    await callback.answer(f"{meta['emoji']} Раунд сыгран!")
+
+
+@dp.callback_query(F.data.startswith("sp_pvec:"))
+async def callback_sport_pve_cancel(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    sport = parts[1]
+    owner_id = int(parts[2])
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    game_key = sport_pve_key(sport, callback.message.chat.id, owner_id)
+    game = active_sport_pve_games.get(game_key)
+
+    if not game:
+        await callback.answer("Эта игра уже завершена!", show_alert=True)
+        return
+
+    active_sport_pve_games.pop(game_key, None)
+    await update_balance(owner_id, game["bet"])
+    await _remove_game("sport_pve", game_key)
+
+    try:
+        await callback.message.edit_text(
+            "❌ Матч отменён. Ставка возвращена.",
+            reply_markup=build_sport_disabled_keyboard()
+        )
+    except Exception:
+        pass
+
+    await callback.answer("Матч отменён")
+
+
+@dp.callback_query(F.data.startswith("sp_acc:"))
+async def callback_sport_pvp_accept(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    sport = parts[1]
+    match_id = parts[2]
+
+    d = pending_sport_pvp.get(match_id)
+
+    if not d or d["sport"] != sport:
+        await callback.answer("Этот матч больше неактивен!", show_alert=True)
+        return
+
+    if callback.from_user.id != d["target_id"]:
+        await callback.answer("❌ Принять вызов может только вызванный игрок!", show_alert=True)
+        return
+
+    target_user = await get_or_create_user(d["target_id"], callback.from_user.username)
+
+    if not check_balance(target_user['tg_id'], target_user['balance'], d['bet']):
+        await callback.answer("❌ У вас недостаточно монет для принятия дуэли!", show_alert=True)
+        return
+
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
+
+    del pending_sport_pvp[match_id]
+    await _remove_game("sport_pvp_pending", match_id)
+
+    await update_balance(target_user['tg_id'], -d['bet'])
+
+    active = {
+        "sport": sport,
+        "chat_id": callback.message.chat.id,
+        "match_id": match_id,
+        "p1_id": d["challenger_id"],
+        "p1_html": d["challenger_html"],
+        "p2_id": d["target_id"],
+        "p2_html": d["target_html"],
+        "bet": d["bet"],
+        "round": 1,
+        "max_rounds": SPORT_MAX_ROUNDS,
+        "p1_score": 0,
+        "p2_score": 0,
+        "rolls": {"p1": None, "p2": None},
+        "msg": callback.message,
+        "timer_task": None
+    }
+
+    active["timer_task"] = asyncio.create_task(sport_pvp_round_timeout(match_id))
+    active_sport_pvp[match_id] = active
+
+    await _save_game("sport_pvp_active", match_id, callback.message.chat.id, active["p1_id"], active["bet"])
+    await _save_game("sport_pvp_active", match_id, callback.message.chat.id, active["p2_id"], active["bet"])
+
+    text = render_sport_pvp(active, "Оба игрока должны нажать кнопку! У кого эмодзи сильнее — тот выигрывает раунд.")
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=build_sport_active_keyboard(sport, match_id)
+    )
+
+    await callback.answer("Матч начался!")
+
+
+@dp.callback_query(F.data.startswith("sp_dec:"))
+async def callback_sport_pvp_decline(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    sport = parts[1]
+    match_id = parts[2]
+
+    d = pending_sport_pvp.get(match_id)
+
+    if not d or d["sport"] != sport:
+        await callback.answer("Этот матч больше неактивен!", show_alert=True)
+        return
+
+    if callback.from_user.id != d["target_id"]:
+        await callback.answer("❌ Отклонить вызов может только вызванный игрок!", show_alert=True)
+        return
+
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
+
+    del pending_sport_pvp[match_id]
+    await _remove_game("sport_pvp_pending", match_id)
+
+    await update_balance(d["challenger_id"], d["bet"])
+
+    try:
+        await callback.message.edit_text(f"⛔ {d['target_html']} отклонил(а) матч. Ставка возвращена.", parse_mode="HTML")
+    except Exception:
+        pass
+
+    await callback.answer("Матч отклонён")
+
+
+@dp.callback_query(F.data.startswith("sp_roll:"))
+async def callback_sport_pvp_roll(callback: types.CallbackQuery):
+    parts = callback.data.split(":")
+    sport = parts[1]
+    match_id = parts[2]
+
+    d = active_sport_pvp.get(match_id)
+
+    if not d or d["sport"] != sport:
+        await callback.answer("Этот матч уже завершён!", show_alert=True)
+        return
+
+    uid = callback.from_user.id
+
+    if uid not in (d["p1_id"], d["p2_id"]):
+        await callback.answer("❌ Это не ваша игра!", show_alert=True)
+        return
+
+    slot = "p1" if uid == d["p1_id"] else "p2"
+
+    if d["rolls"][slot] is not None:
+        await callback.answer("Вы уже сделали ход! Ждите соперника.")
+        return
+
+    meta = SPORT_META[sport]
+
+    await callback.answer()
+
+    roll = await send_sport_dice(callback.message.chat.id, meta["dice"])
+    d["rolls"][slot] = roll
+
+    if d["rolls"]["p1"] is None or d["rolls"]["p2"] is None:
+        rolled_html = d["p1_html"] if slot == "p1" else d["p2_html"]
+        extra = f"✅ {rolled_html} сделал(а) {meta['action'].lower()}! Ожидание второго игрока..."
+
+        try:
+            await callback.message.edit_text(
+                render_sport_pvp(d, extra),
+                parse_mode="HTML",
+                reply_markup=build_sport_active_keyboard(sport, match_id)
+            )
+        except Exception:
+            pass
+
+        return
+
+    # Оба игрока сделали ход
+    if active_sport_pvp.get(match_id) is not d:
+        return
+
+    if d.get("timer_task"):
+        d["timer_task"].cancel()
+
+    r1 = d["rolls"]["p1"]
+    r2 = d["rolls"]["p2"]
+
+    if r1 > r2:
+        d["p1_score"] += 1
+        extra = f"✅ Раунд {d['round']}: <b>{r1}</b> — <b>{r2}</b>\nРаунд за {d['p1_html']}!"
+    elif r2 > r1:
+        d["p2_score"] += 1
+        extra = f"✅ Раунд {d['round']}: <b>{r1}</b> — <b>{r2}</b>\nРаунд за {d['p2_html']}!"
+    else:
+        extra = f"🤝 Раунд {d['round']}: <b>{r1}</b> — <b>{r2}</b>\nНичья в раунде!"
+
+    d["round"] += 1
+    d["rolls"] = {"p1": None, "p2": None}
+
+    if d["round"] > d["max_rounds"]:
+        alert = await settle_sport_pvp(match_id, d, callback.message, extra)
+        await callback.answer(alert)
+        return
+
+    d["timer_task"] = asyncio.create_task(sport_pvp_round_timeout(match_id))
+
+    try:
+        await callback.message.edit_text(
+            render_sport_pvp(d, extra),
+            parse_mode="HTML",
+            reply_markup=build_sport_active_keyboard(sport, match_id)
+        )
+    except Exception:
+        pass
+
+    await callback.answer(f"{meta['emoji']} Раунд сыгран!")
+
+
+@dp.callback_query(F.data == "sp_dis")
+async def callback_sport_disabled(callback: types.CallbackQuery):
+    await callback.answer("Эта игра уже завершена!")
 
 
 # ----------------------------------------------------
